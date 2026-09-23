@@ -1,13 +1,28 @@
+import io
 import os
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
-from local_file_organizer.cli import run_scan
+from PIL import Image
+
+from local_file_organizer.cli import run_scan, run_similar_images
 from local_file_organizer.metadata import ffprobe_available
+from local_file_organizer.perceptual_hash import compute_dhash, hamming_distance
 from local_file_organizer.snapshot import diff_snapshots, load_snapshot
+
+
+def _save_gradient(path: Path, size=(64, 64), fmt="PNG"):
+    img = Image.new("RGB", size)
+    pixels = img.load()
+    for x in range(size[0]):
+        for y in range(size[1]):
+            value = int(255 * x / size[0])
+            pixels[x, y] = (value, value, value)
+    img.save(path, format=fmt)
 
 
 class RunScanTests(unittest.TestCase):
@@ -168,6 +183,181 @@ class RunScanTests(unittest.TestCase):
         self.assertEqual(row["scan_status"], "ok")
         self.assertEqual(row["metadata_status"], "skipped")
         self.assertIsNone(row["metadata_error"])
+
+    def test_valid_image_gets_perceptual_hash(self):
+        image_path = self.target / "photo.png"
+        _save_gradient(image_path)
+
+        run_scan(self.target, db_path=self.db_path, csv_path=self.csv_path, quiet=True)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM files WHERE name = 'photo.png'").fetchone()
+        conn.close()
+
+        self.assertEqual(row["scan_status"], "ok")
+        self.assertEqual(row["category"], "image")
+        self.assertEqual(row["metadata_status"], "ok")
+        self.assertIsNone(row["metadata_error"])
+        self.assertIsNotNone(row["perceptual_hash"])
+        self.assertEqual(row["similarity_method"], "dhash8x8")
+
+    def test_corrupt_image_metadata_failure_does_not_mark_scan_failed(self):
+        fake_image = self.target / "not-really-an-image.png"
+        fake_image.write_bytes(b"this is not a valid PNG file")
+
+        run_scan(self.target, db_path=self.db_path, csv_path=self.csv_path, quiet=True)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM files WHERE name = 'not-really-an-image.png'"
+        ).fetchone()
+        conn.close()
+
+        # The basic inventory step succeeded (it's a real, readable file).
+        self.assertEqual(row["category"], "image")
+        self.assertEqual(row["scan_status"], "ok")
+        self.assertIsNone(row["scan_error"])
+        # Only the specialized perceptual-hash extraction failed.
+        self.assertEqual(row["metadata_status"], "error")
+        self.assertIsNotNone(row["metadata_error"])
+        self.assertIsNone(row["perceptual_hash"])
+
+    def test_similar_images_are_grouped_and_duplicate_group_stays_separate(self):
+        # Two images with different exact bytes (PNG vs JPEG of the same
+        # picture): no SHA-256 duplicate, but they should land in the same
+        # perceptual similarity group. A third, unrelated image stays
+        # ungrouped.
+        _save_gradient(self.target / "a.png", fmt="PNG")
+        _save_gradient(self.target / "b.jpg", fmt="JPEG")
+        checker = Image.new("RGB", (64, 64))
+        pixels = checker.load()
+        for x in range(64):
+            for y in range(64):
+                pixels[x, y] = (255, 255, 255) if (x // 8 + y // 8) % 2 == 0 else (0, 0, 0)
+        checker.save(self.target / "c-checker.png", format="PNG")
+
+        run_scan(self.target, db_path=self.db_path, csv_path=self.csv_path, quiet=True)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = {r["name"]: r for r in conn.execute("SELECT * FROM files").fetchall()}
+        conn.close()
+
+        self.assertIsNone(rows["a.png"]["duplicate_group"])
+        self.assertIsNone(rows["b.jpg"]["duplicate_group"])
+        self.assertIsNotNone(rows["a.png"]["similar_group"])
+        self.assertEqual(rows["a.png"]["similar_group"], rows["b.jpg"]["similar_group"])
+        self.assertIsNone(rows["c-checker.png"]["similar_group"])
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_similar_images(db_path=self.db_path)
+        printed = output.getvalue()
+        self.assertIn(rows["a.png"]["similar_group"], printed)
+        self.assertIn("2 imágenes", printed)
+        self.assertIn("distancia máx:", printed)
+        self.assertIn(str(self.target / "a.png"), printed)
+        self.assertNotIn("c-checker.png", printed)
+
+    def test_rescanning_images_does_not_duplicate_similar_groups(self):
+        _save_gradient(self.target / "a.png")
+        _save_gradient(self.target / "b.png")
+
+        run_scan(self.target, db_path=self.db_path, csv_path=self.csv_path, quiet=True)
+        run_scan(self.target, db_path=self.db_path, csv_path=self.csv_path, quiet=True)
+
+        conn = sqlite3.connect(str(self.db_path))
+        count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        group_count = conn.execute(
+            "SELECT COUNT(DISTINCT similar_group) FROM files WHERE similar_group IS NOT NULL"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 2)
+        self.assertEqual(group_count, 1)
+
+    def test_similar_groups_reset_when_threshold_tightens(self):
+        # V2.1.1 reset: scan with threshold=8 groups a pair whose distance
+        # is in (2, 8]; rescanning the same tree with threshold=2 must leave
+        # both ungrouped with no stale group IDs behind.
+        base = self.target / "base.png"
+        _save_gradient(base)
+        base_hash = compute_dhash(base)
+
+        variant_path = None
+        variant_distance = None
+        for square_size, pos in (
+            (16, (16, 16)),
+            (16, (32, 32)),
+            (16, (48, 48)),
+            (32, (0, 0)),
+            (32, (48, 48)),
+            (8, (48, 48)),
+            (32, (32, 32)),
+        ):
+            candidate = self.target / f"variant-{square_size}-{pos[0]}.png"
+            img = Image.open(base).copy()
+            pixels = img.load()
+            for x in range(pos[0], min(64, pos[0] + square_size)):
+                for y in range(pos[1], min(64, pos[1] + square_size)):
+                    pixels[x, y] = (0, 0, 0)
+            img.save(candidate, format="PNG")
+            distance = hamming_distance(base_hash, compute_dhash(candidate))
+            if 2 < distance <= 8:
+                variant_path = candidate
+                variant_distance = distance
+                break
+            candidate.unlink()
+        self.assertIsNotNone(
+            variant_path, "expected a variant with distance in (2, 8]"
+        )
+        assert variant_path is not None  # for type checkers
+        self.assertGreater(variant_distance, 2)
+        self.assertLessEqual(variant_distance, 8)
+
+        run_scan(
+            self.target,
+            db_path=self.db_path,
+            csv_path=self.csv_path,
+            quiet=True,
+            similarity_threshold=8,
+        )
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = {r["name"]: r for r in conn.execute("SELECT * FROM files").fetchall()}
+        conn.close()
+        self.assertIsNotNone(rows[base.name]["similar_group"])
+        self.assertEqual(
+            rows[base.name]["similar_group"],
+            rows[variant_path.name]["similar_group"],
+        )
+        # Different bytes: perceptual grouping must not create SHA-256 groups.
+        self.assertIsNone(rows[base.name]["duplicate_group"])
+        self.assertIsNone(rows[variant_path.name]["duplicate_group"])
+        old_group = rows[base.name]["similar_group"]
+
+        run_scan(
+            self.target,
+            db_path=self.db_path,
+            csv_path=self.csv_path,
+            quiet=True,
+            similarity_threshold=2,
+        )
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows_after = {
+            r["name"]: r for r in conn.execute("SELECT * FROM files").fetchall()
+        }
+        remaining = conn.execute(
+            "SELECT DISTINCT similar_group FROM files WHERE similar_group IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        self.assertIsNone(rows_after[base.name]["similar_group"])
+        self.assertIsNone(rows_after[variant_path.name]["similar_group"])
+        self.assertEqual(remaining, [])
+        # The old group ID must not linger on any row.
+        self.assertNotIn(old_group, [r["similar_group"] for r in rows_after.values()])
 
     def test_verify_readonly_reports_clean_diff(self):
         (self.target / "a.txt").write_text("hello")

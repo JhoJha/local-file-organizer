@@ -7,7 +7,13 @@ name = "local-file-organizer"
 version = "0.1.0"
 description = "Inventario local y read-only de archivos personales (V1)."
 requires-python = ">=3.9"
-dependencies = []
+dependencies = [
+    # Needed only for V2.1 perceptual image hashing: the standard library
+    # has no JPEG/PNG decoder, and Pillow is the small, well-maintained
+    # library that fills that one gap (grayscale + resize) without pulling
+    # in a heavier CV/ML stack.
+    "pillow>=9.1,<13",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

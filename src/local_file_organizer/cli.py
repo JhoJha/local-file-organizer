@@ -1,7 +1,8 @@
-"""Command-line interface: scan, summary, duplicates.
+"""Command-line interface: scan, summary, duplicates, similar-images.
 
 Every code path in this module is read-only with respect to the scanned
-tree: it lists files, reads their metadata/bytes, and writes results only
+tree: it lists files, reads their metadata/bytes (including decoding
+images in memory to compute a perceptual hash), and writes results only
 under this project's own data/ and reports/ directories.
 """
 from __future__ import annotations
@@ -15,6 +16,13 @@ from . import database
 from .classifier import classify
 from .hashing import DuplicateRecord, find_duplicates
 from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
+from .perceptual_hash import (
+    DEFAULT_SIMILARITY_THRESHOLD,
+    SimilarityRecord,
+    get_image_metadata,
+    group_similar_images,
+    hamming_distance,
+)
 from .reporting import build_summary_text, export_csv
 from .scanner import DEFAULT_IGNORED_DIRS, ScanError, iter_files
 from .snapshot import capture_snapshot, diff_snapshots, save_snapshot
@@ -66,6 +74,15 @@ def _scan_one_file(path: Path) -> database.FileRecord:
             record.metadata_error = video.error
         else:
             record.metadata_status = "ok"
+    elif basic.category == "image":
+        image = get_image_metadata(path)
+        if image.error:
+            record.metadata_status = "error"
+            record.metadata_error = image.error
+        else:
+            record.metadata_status = "ok"
+            record.perceptual_hash = image.perceptual_hash
+            record.similarity_method = image.similarity_method
     # Other categories have no specialized extraction yet in V1, so
     # metadata_status keeps its "skipped" default.
 
@@ -80,6 +97,7 @@ def run_scan(
     quiet: bool = False,
     verify_readonly: bool = False,
     snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+    similarity_threshold: int = DEFAULT_SIMILARITY_THRESHOLD,
 ) -> None:
     if not target.exists():
         print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
@@ -112,16 +130,27 @@ def run_scan(
     conn = database.connect(db_path)
     scanned_paths: list[str] = []
     duplicate_candidates: list[DuplicateRecord] = []
+    image_hash_candidates: list[SimilarityRecord] = []
 
     count = 0
     for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
         record = _scan_one_file(file_path)
         record.duplicate_group = None
+        record.similar_group = None
         database.upsert_file(conn, record)
         scanned_paths.append(record.path)
         if record.scan_status == "ok":
             duplicate_candidates.append(
                 DuplicateRecord(path=record.path, size_bytes=record.size_bytes)
+            )
+        if record.category == "image" and record.perceptual_hash:
+            image_hash_candidates.append(
+                SimilarityRecord(
+                    path=record.path,
+                    perceptual_hash=record.perceptual_hash,
+                    size_bytes=record.size_bytes,
+                    extension=record.extension,
+                )
             )
         count += 1
         if not quiet and count % _PROGRESS_INTERVAL == 0:
@@ -138,6 +167,12 @@ def run_scan(
     database.clear_duplicate_groups(conn, scanned_paths)
     for path, group_id in dup_stats.group_by_path.items():
         database.set_duplicate_group(conn, path, group_id)
+    conn.commit()
+
+    sim_stats = group_similar_images(image_hash_candidates, threshold=similarity_threshold)
+    database.clear_similar_groups(conn, scanned_paths)
+    for path, group_id in sim_stats.group_by_path.items():
+        database.set_similar_group(conn, path, group_id)
     conn.commit()
 
     if verify_readonly:
@@ -182,6 +217,9 @@ def run_scan(
         duplicate_group_count=dup_stats.total_duplicate_groups,
         recoverable_bytes=dup_stats.recoverable_space_bytes,
         error_count=error_count,
+        image_hash_count=len(image_hash_candidates),
+        similar_group_count=sim_stats.total_groups,
+        similar_grouped_file_count=sim_stats.total_grouped_files,
     )
     print()
     print(summary)
@@ -211,6 +249,9 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
         (row["count"] - 1) * row["size_bytes"] for row in dup_groups
     )
     error_count = database.fetch_error_count(conn)
+    image_hash_count = database.fetch_perceptual_hash_count(conn)
+    sim_groups = database.fetch_similar_groups(conn)
+    similar_grouped_file_count = sum(row["count"] for row in sim_groups)
 
     summary = build_summary_text(
         category_totals=category_totals,
@@ -220,6 +261,9 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
         duplicate_group_count=len(dup_groups),
         recoverable_bytes=recoverable_bytes,
         error_count=error_count,
+        image_hash_count=image_hash_count,
+        similar_group_count=len(sim_groups),
+        similar_grouped_file_count=similar_grouped_file_count,
     )
     print(summary)
     conn.close()
@@ -244,6 +288,37 @@ def run_duplicates(db_path: Path = DEFAULT_DB_PATH) -> None:
         print(f"{group_id}  ({group['count']} archivos, {size_human} c/u)")
         for file_row in database.fetch_duplicate_files(conn, group_id):
             print(f"  - {file_row['path']}")
+    conn.close()
+
+
+def run_similar_images(db_path: Path = DEFAULT_DB_PATH) -> None:
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    groups = database.fetch_similar_groups(conn)
+    if not groups:
+        print("No se encontraron grupos de imágenes visualmente similares.")
+        conn.close()
+        return
+    for group in groups:
+        group_id = group["similar_group"]
+        files = database.fetch_similar_files(conn, group_id)
+        hashes = [f["perceptual_hash"] for f in files]
+        max_distance = 0
+        for i in range(len(hashes)):
+            for j in range(i + 1, len(hashes)):
+                max_distance = max(max_distance, hamming_distance(hashes[i], hashes[j]))
+        print(group_id)
+        print(f"  {len(files)} imágenes")
+        print(f"  distancia máx: {max_distance}")
+        for file_row in files:
+            size_human = human_readable_size(file_row["size_bytes"] or 0)
+            print(f"  - {file_row['path']} ({size_human}, {file_row['extension']})")
+        print()
     conn.close()
 
 
@@ -280,12 +355,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SNAPSHOT_DIR,
         help="Directorio (bajo el repo) donde guardar before.json/after.json.",
     )
+    scan_parser.add_argument(
+        "--similarity-threshold",
+        type=int,
+        default=DEFAULT_SIMILARITY_THRESHOLD,
+        help=(
+            "Distancia Hamming máxima (0-64) para agrupar imágenes como "
+            f"visualmente similares (por defecto {DEFAULT_SIMILARITY_THRESHOLD})."
+        ),
+    )
 
     summary_parser = subparsers.add_parser("summary", help="Mostrar resumen del catálogo existente.")
     summary_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
 
     duplicates_parser = subparsers.add_parser("duplicates", help="Listar grupos de duplicados.")
     duplicates_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    similar_parser = subparsers.add_parser(
+        "similar-images", help="Listar grupos de imágenes visualmente similares (hash perceptual)."
+    )
+    similar_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
 
     return parser
 
@@ -303,11 +392,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             quiet=args.quiet,
             verify_readonly=args.verify_readonly,
             snapshot_dir=args.snapshot_dir,
+            similarity_threshold=args.similarity_threshold,
         )
     elif args.command == "summary":
         run_summary(db_path=args.db)
     elif args.command == "duplicates":
         run_duplicates(db_path=args.db)
+    elif args.command == "similar-images":
+        run_similar_images(db_path=args.db)
 
 
 if __name__ == "__main__":

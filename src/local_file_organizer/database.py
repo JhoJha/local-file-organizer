@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS files (
     mime_type TEXT,
     sha256 TEXT,
     duplicate_group TEXT,
+    similar_group TEXT,
 
     duration_seconds REAL,
     width INTEGER,
@@ -27,6 +28,9 @@ CREATE TABLE IF NOT EXISTS files (
     video_codec TEXT,
     audio_codec TEXT,
     bitrate INTEGER,
+
+    perceptual_hash TEXT,
+    similarity_method TEXT,
 
     scan_status TEXT,
     scan_error TEXT,
@@ -42,13 +46,18 @@ CREATE TABLE IF NOT EXISTS files (
 _ADDED_COLUMNS: dict[str, str] = {
     "metadata_status": "TEXT",
     "metadata_error": "TEXT",
+    # V2.1: perceptual hashing for images.
+    "similar_group": "TEXT",
+    "perceptual_hash": "TEXT",
+    "similarity_method": "TEXT",
 }
 
 _FILE_COLUMNS = [
     "path", "name", "extension", "category", "size_bytes", "modified_at",
-    "mime_type", "sha256", "duplicate_group",
+    "mime_type", "sha256", "duplicate_group", "similar_group",
     "duration_seconds", "width", "height", "fps", "video_codec",
     "audio_codec", "bitrate",
+    "perceptual_hash", "similarity_method",
     "scan_status", "scan_error",
     "metadata_status", "metadata_error",
 ]
@@ -71,7 +80,10 @@ class FileRecord:
       valid. Its value is ``"ok"`` when extraction succeeded, ``"error"``
       when it was attempted and failed, or ``"skipped"`` when the category
       has no specialized extraction (or the basic scan already failed, so
-      extraction was never attempted).
+      extraction was never attempted). Images use this same pair for
+      perceptual-hash extraction (V2.1): ``metadata_error`` holds the
+      Pillow failure when a file can't be decoded as an image, which never
+      flips ``scan_status`` either.
     """
 
     path: str
@@ -83,6 +95,7 @@ class FileRecord:
     mime_type: Optional[str] = None
     sha256: Optional[str] = None
     duplicate_group: Optional[str] = None
+    similar_group: Optional[str] = None
 
     duration_seconds: Optional[float] = None
     width: Optional[int] = None
@@ -91,6 +104,9 @@ class FileRecord:
     video_codec: Optional[str] = None
     audio_codec: Optional[str] = None
     bitrate: Optional[int] = None
+
+    perceptual_hash: Optional[str] = None
+    similarity_method: Optional[str] = None
 
     scan_status: str = "ok"
     scan_error: Optional[str] = None
@@ -227,3 +243,47 @@ def fetch_error_count(conn: sqlite3.Connection, paths: Optional[list[str]] = Non
 def fetch_all_files(conn: sqlite3.Connection):
     cur = conn.execute("SELECT * FROM files ORDER BY path")
     return cur.fetchall()
+
+
+def set_similar_group(conn: sqlite3.Connection, path: str, group_id: Optional[str]) -> None:
+    conn.execute(
+        "UPDATE files SET similar_group = ? WHERE path = ?", (group_id, path)
+    )
+
+
+def clear_similar_groups(conn: sqlite3.Connection, paths: list[str]) -> None:
+    if not paths:
+        return
+    placeholders = ", ".join("?" for _ in paths)
+    conn.execute(
+        f"UPDATE files SET similar_group = NULL WHERE path IN ({placeholders})",
+        paths,
+    )
+
+
+def fetch_similar_groups(conn: sqlite3.Connection):
+    cur = conn.execute(
+        "SELECT similar_group, COUNT(*) AS count FROM files "
+        "WHERE similar_group IS NOT NULL "
+        "GROUP BY similar_group ORDER BY similar_group"
+    )
+    return cur.fetchall()
+
+
+def fetch_similar_files(conn: sqlite3.Connection, group_id: Optional[str] = None):
+    if group_id is None:
+        cur = conn.execute(
+            "SELECT * FROM files WHERE similar_group IS NOT NULL "
+            "ORDER BY similar_group, path"
+        )
+    else:
+        cur = conn.execute(
+            "SELECT * FROM files WHERE similar_group = ? ORDER BY path",
+            (group_id,),
+        )
+    return cur.fetchall()
+
+
+def fetch_perceptual_hash_count(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
+    return cur.fetchone()[0]

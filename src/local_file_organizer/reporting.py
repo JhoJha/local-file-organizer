@@ -10,9 +10,10 @@ from .metadata import human_readable_size
 
 CSV_COLUMNS = [
     "path", "name", "extension", "category", "size_bytes", "size_human",
-    "modified_at", "mime_type", "sha256", "duplicate_group",
+    "modified_at", "mime_type", "sha256", "duplicate_group", "similar_group",
     "duration_seconds", "width", "height", "fps", "video_codec",
-    "audio_codec", "bitrate", "scan_status", "scan_error",
+    "audio_codec", "bitrate", "perceptual_hash", "similarity_method",
+    "scan_status", "scan_error",
     "metadata_status", "metadata_error",
 ]
 
@@ -40,6 +41,9 @@ def build_summary_text(
     duplicate_group_count: int,
     recoverable_bytes: int,
     error_count: int,
+    image_hash_count: int = 0,
+    similar_group_count: int = 0,
+    similar_grouped_file_count: int = 0,
 ) -> str:
     lines = ["=== RESUMEN ===", ""]
     for row in category_totals:
@@ -58,6 +62,13 @@ def build_summary_text(
     lines.append(f"{duplicate_file_count} archivos en grupos duplicados")
     lines.append(f"{duplicate_group_count} grupos")
     lines.append(f"Espacio potencialmente recuperable: {human_readable_size(recoverable_bytes)}")
+
+    lines.append("")
+    lines.append("Imágenes similares (hash perceptual):")
+    lines.append(f"{image_hash_count} imágenes con hash perceptual calculado")
+    lines.append(f"{similar_group_count} grupos de similares detectados")
+    lines.append(f"{similar_grouped_file_count} imágenes agrupadas")
+    lines.append(f"{max(image_hash_count - similar_grouped_file_count, 0)} imágenes sin grupo (únicas)")
 
     lines.append("")
     lines.append("Errores:")

@@ -58,6 +58,56 @@ class UpsertTests(unittest.TestCase):
         self.assertIn("metadata_error", columns)
         conn.close()
 
+    def test_similarity_columns_exist_on_fresh_db(self):
+        conn = connect(self.db_path)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+        self.assertIn("perceptual_hash", columns)
+        self.assertIn("similar_group", columns)
+        self.assertIn("similarity_method", columns)
+        conn.close()
+
+    def test_migration_adds_similarity_columns_to_pre_v2_1_db(self):
+        # Simulate a V1/V2.0 catalog: has metadata_status/metadata_error
+        # but predates perceptual_hash/similar_group/similarity_method.
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            """
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                name TEXT,
+                category TEXT,
+                scan_status TEXT,
+                scan_error TEXT,
+                metadata_status TEXT,
+                metadata_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO files (path, name, category, scan_status, metadata_status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("/old/photo.png", "photo.png", "image", "ok", "skipped"),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = connect(self.db_path)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+        self.assertIn("perceptual_hash", columns)
+        self.assertIn("similar_group", columns)
+        self.assertIn("similarity_method", columns)
+
+        row = conn.execute("SELECT * FROM files WHERE path = '/old/photo.png'").fetchone()
+        self.assertEqual(row["name"], "photo.png")
+        self.assertEqual(row["scan_status"], "ok")
+        self.assertIsNone(row["perceptual_hash"])
+        self.assertIsNone(row["similar_group"])
+
+        total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        self.assertEqual(total, 1)
+        conn.close()
+
     def test_migration_adds_metadata_columns_to_pre_existing_db(self):
         # Simulate a catalog created before metadata_status/metadata_error
         # existed: a "files" table without them, holding one row.
