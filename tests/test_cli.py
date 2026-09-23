@@ -1054,6 +1054,7 @@ class OrganizePreviewCliTests(unittest.TestCase):
         self.output_dir.mkdir()
         self.db_path = self.output_dir / "catalog.sqlite"
         self.plan_path = self.output_dir / "organization_plan.json"
+        self.decisions_path = self.output_dir / "face_review_decisions.json"
 
     def _seed(self):
         from local_file_organizer import database
@@ -1117,15 +1118,23 @@ class OrganizePreviewCliTests(unittest.TestCase):
         printed = output.getvalue()
         for token in (
             "=== ORGANIZATION PREVIEW ===",
-            "Media/", "Personas/", "P0004/", "Sin_personas/",
+            "Media/", "Sin_personas/",
             "Documentos/", "PDF/",
-            "Revisión/", "Metadata_incompleta/", "Errores_de_escaneo/",
+            "Revisión/", "Baja_evidencia/", "Metadata_incompleta/",
+            "Errores_de_escaneo/",
             "FLAGS:", "exact_duplicates=", "visual_similar_groups=",
+            "=== DESTINATIONS ===",
+            "person_destinations=0", "pair_destinations=0",
+            "group_destinations=0", "review_destinations=3", "sin_personas=1",
+            "=== CONFIDENCE ===", "high=2", "medium=0", "low=3",
             "=== ACCOUNTING ===",
-            "catalog_files=5", "planned=3", "review=1", "unsupported=1",
+            "catalog_files=5", "planned=2", "review=2", "unsupported=1",
             "PREVIEW ONLY", "moved=0", "copied=0", "renamed=0", "deleted=0",
         ):
             self.assertIn(token, printed)
+        # Revisión/ is listed right after Media/ and before Documentos/.
+        self.assertLess(printed.index("Media/"), printed.index("Revisión/"))
+        self.assertLess(printed.index("Revisión/"), printed.index("Documentos/"))
         for secret in secrets:
             self.assertNotIn(secret, printed)
 
@@ -1136,7 +1145,8 @@ class OrganizePreviewCliTests(unittest.TestCase):
             self.assertEqual(
                 set(entry.keys()),
                 {"file_id", "category", "bucket", "proposed_destination",
-                 "reason_codes", "flags", "confidence", "action"})
+                 "reason_codes", "flags", "confidence_level", "action"})
+            self.assertNotIn("confidence", entry)
         serialized = self.plan_path.read_text(encoding="utf-8")
         for secret in secrets:
             self.assertNotIn(secret, serialized)
@@ -1157,6 +1167,126 @@ class OrganizePreviewCliTests(unittest.TestCase):
                 db_path=self.db_path, plan_path=self.plan_path,
                 show_files=True, quiet=True)
         self.assertIn(secrets[0], shown_out.getvalue())
+
+    def _seed_decisions(self):
+        from local_file_organizer import database
+        from local_file_organizer.face_review import save_decisions
+
+        conn = database.connect(self.db_path)
+        base = str(Path(self.tmpdir.name) / "media")
+        self.p_conf = base + "/confirmada.jpg"
+        self.p_rej = base + "/rechazada.jpg"
+        self.p_zero = base + "/libre.jpg"
+        for path in (self.p_conf, self.p_rej, self.p_zero):
+            database.upsert_file(
+                conn,
+                database.FileRecord(
+                    path=path, name=Path(path).name, extension=".jpg",
+                    category="image", scan_status="ok", metadata_status="ok"),
+            )
+        database.insert_person_cluster_members(conn, [
+            ("P0001", self.p_conf, "image", 1),
+            ("P0002", self.p_rej, "image", 1),
+        ])
+        conn.commit()
+        conn.close()
+        save_decisions(
+            self.decisions_path, {"P0001": "confirmed", "P0002": "rejected"}
+        )
+        return [self.p_conf, self.p_rej, self.p_zero]
+
+    def test_decisions_routing_destinations_and_confidence(self):
+        from local_file_organizer.cli import run_organize_preview
+
+        secrets = self._seed_decisions()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path,
+                decisions_path=self.decisions_path, quiet=True)
+        printed = output.getvalue()
+        for token in (
+            "Personas/", "P0001/", "Sin_personas/",
+            "Revisión/", "Cluster_rechazado/",
+            "=== DESTINATIONS ===",
+            "person_destinations=1", "pair_destinations=0",
+            "group_destinations=0", "review_destinations=1", "sin_personas=1",
+            "=== CONFIDENCE ===", "high=2", "medium=0", "low=1",
+            "=== ACCOUNTING ===",
+            "catalog_files=3", "planned=2", "review=1", "unsupported=0",
+            "PREVIEW ONLY", "moved=0", "copied=0", "renamed=0", "deleted=0",
+        ):
+            self.assertIn(token, printed)
+        for secret in secrets:
+            self.assertNotIn(secret, printed)
+
+        shown = io.StringIO()
+        with redirect_stdout(shown):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path,
+                decisions_path=self.decisions_path, show_files=True, quiet=True)
+        for secret in secrets:
+            self.assertIn(secret, shown.getvalue())
+
+    def test_missing_decisions_file_means_no_decisions(self):
+        from local_file_organizer.cli import run_organize_preview
+
+        self._seed()
+        missing = self.output_dir / "no-existe-decisions.json"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path,
+                decisions_path=missing, quiet=True)
+        printed = output.getvalue()
+        self.assertIn("catalog_files=5", printed)
+        self.assertIn("review=2", printed)
+
+    def test_invalid_decisions_errors(self):
+        from local_file_organizer.cli import run_organize_preview
+
+        self._seed()
+        self.decisions_path.write_text("{no es json", encoding="utf-8")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(err):
+                with redirect_stdout(io.StringIO()):
+                    run_organize_preview(
+                        db_path=self.db_path, plan_path=self.plan_path,
+                        decisions_path=self.decisions_path, quiet=True)
+        self.assertIn("ERROR:", err.getvalue())
+
+    def test_read_only_only_writes_plan(self):
+        from local_file_organizer import database
+        from local_file_organizer.cli import run_organize_preview
+        from local_file_organizer.snapshot import capture_snapshot, diff_snapshots
+
+        target = Path(self.tmpdir.name) / "target"
+        target.mkdir()
+        original = target / "foto.jpg"
+        original.write_bytes(b"contenido original")
+        before = capture_snapshot(target)
+
+        conn = database.connect(self.db_path)
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=str(original), name="foto.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="ok"),
+        )
+        conn.commit()
+        conn.close()
+
+        with redirect_stdout(io.StringIO()):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path,
+                decisions_path=self.decisions_path, quiet=True)
+
+        after = capture_snapshot(target)
+        self.assertTrue(diff_snapshots(before, after).is_clean)
+        self.assertEqual(original.read_bytes(), b"contenido original")
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ["foto.jpg"])
+        self.assertTrue(self.plan_path.exists())
 
     def test_missing_or_empty_catalog_errors(self):
         from local_file_organizer.cli import run_organize_preview

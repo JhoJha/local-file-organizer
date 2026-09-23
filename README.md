@@ -1,4 +1,4 @@
-# local-file-organizer (V2.4.1 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo + revisión de clusters)
+# local-file-organizer (V2.5.1 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo + revisión de clusters + vista previa de organización con confianza)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -42,6 +42,11 @@ servicios en la nube ni usa IA generativa.
     `face-review-import` importa las decisiones humanas — ver
     [Revisión de clusters de personas
     (V2.4.1)](#revisión-de-clusters-de-personas-v241).
+14. (V2.5.1) `organize-preview` simula una estructura de carpetas sin
+    tocar nada, con niveles de confianza `high`/`medium`/`low` y enrutado
+    conservador a `Revisión/` — ver
+    [Vista previa de organización con confianza
+    (V2.5.1)](#vista-previa-de-organización-con-confianza-v251).
 
 ## Qué NO hace (por diseño)
 
@@ -532,31 +537,66 @@ Cada fila en `files` distingue dos fallos independientes:
   queda con `scan_status='ok'` (se pudo inventariar) y
   `metadata_status='error'` con el motivo de Pillow en `metadata_error`.
 
-## Vista previa de organización (V2.5)
+## Vista previa de organización con confianza (V2.5.1)
 
 `organize-preview` es una simulación de solo lectura: lee el catálogo
 SQLite existente (`files`, columnas `duplicate_group`/`similar_group`, y
-`person_cluster_members`) y escribe `reports/organization_plan.json`, sin
-recorrer el sistema de archivos ni mover, copiar, renombrar o borrar nada
-(`moved=0, copied=0, renamed=0, deleted=0`). No existe ningún
-`organize-apply` todavía: los movimientos reales son trabajo futuro
-explícito (V2.6+, no implementado).
+`person_cluster_members`) más las decisiones humanas de V2.4.1, y escribe
+`reports/organization_plan.json`, sin recorrer el sistema de archivos ni
+mover, copiar, renombrar o borrar nada (`moved=0, copied=0, renamed=0,
+deleted=0`). No existe ningún `organize-apply` todavía: los movimientos
+reales son trabajo futuro explícito (V2.6, no implementado).
 
-Tres familias de destinos:
+El principio rector es preferir un falso negativo (mandar a `Revisión/`)
+antes que un falso positivo (asignar el archivo a la persona incorrecta).
 
-- `Media/` por conteo de personas (clusters V2.4): `Sin_personas/`,
-  `Personas/{P000N}/`, `Parejas/{PAIR_000N}/`, `Grupos/{GROUP_000N}/`.
-- `Documentos/{EXT}/`, `Audio/{EXT}/`, `Archivos_comprimidos/`,
-  `Software/`, `Otros/{EXT}/` o `Otros/Sin_extension/` por extensión.
-- `Revisión/` para casos de baja confianza: `Metadata_incompleta/`
-  (inventario ok pero extracción especializada falló) y
-  `Errores_de_escaneo/` (falló el inventario básico).
+### Niveles de confianza (sin probabilidades)
 
-Invariante contable: `catalog_files = planned + review + unsupported`.
-Cada archivo cae en exactamente un bucket: `unsupported`
-(`scan_status='error'`), `review` (`scan_status='ok'`, imagen/video con
-`metadata_status='error'`), o `planned` (todo lo demás, incluyendo
-`other` y multimedia con `metadata_status` `ok`/`skipped`).
+Cada entrada del plan lleva `confidence_level` (`high`/`medium`/`low`),
+nunca un número ni una probabilidad inventada. Reglas exactas, en orden:
+
+1. La decisión humana (V2.4.1) manda: `confirmed` → `high`;
+   `rejected`/`uncertain` → `low`.
+2. Sin decisión, manda la evidencia contable por cluster
+   (`person_evidence`: `files` = archivos distintos, `observations` =
+   suma de `observation_count`): `files >= 3` y `observations >= 3` →
+   `high`; `files >= 2` → `medium`; el resto (singleton / evidencia
+   débil) → `low`.
+
+La cohesión de embeddings no se persiste (privacidad, V2.4), así que
+`observations` actúa como proxy transparente de la evidencia. No se
+muestra ni almacena ninguna probabilidad.
+
+### Routing
+
+- Imagen/video con `scan_status='ok'` y `metadata_status!='error'`:
+  - 0 personas → `Media/Sin_personas/` (`high`).
+  - 1 persona con nivel `high`/`medium` → `Media/Personas/{P000N}/`.
+    - Nivel `low` + `rejected` → `Revisión/Cluster_rechazado/`.
+    - Nivel `low` + `uncertain` → `Revisión/Persona_incierta/`.
+    - Nivel `low` sin revisar (singleton) → `Revisión/Baja_evidencia/`.
+  - 2 personas → `Media/Parejas/{PAIR_000N}/` solo si ambos miembros son
+    `high`/`medium`; si algún miembro es `rejected` va a
+    `Revisión/Cluster_rechazado/`, y si es `uncertain` o `low` a
+    `Revisión/Persona_incierta/`.
+  - 3+ personas → análogo con `Media/Grupos/{GROUP_000N}/`.
+- `scan_status='error'` → `Revisión/Errores_de_escaneo/` (`unsupported`).
+- Imagen/video ok con `metadata_status='error'` →
+  `Revisión/Metadata_incompleta/`.
+- No media, por extensión: `Documentos/{EXT}/`, `Audio/{EXT}/`,
+  `Archivos_comprimidos/` y `Software/` (`high`), más `Otros/{EXT}/` /
+  `Otros/Sin_extension/` (`medium`).
+
+Todos los destinos de `Revisión/` llevan `confidence_level="low"`; los
+casos de persona y metadatos llevan además `bucket="review"`, mientras
+que `Errores_de_escaneo/` mantiene `bucket="unsupported"`. Los labels
+`PAIR_000N`/`GROUP_000N` se derivan de todas las tuplas ordenadas de
+personas, con o sin decisión, para que la numeración sea determinista y
+estable.
+
+Invariante contable: `catalog_files = planned + review + unsupported`; el
+plan añade `confidence_levels` (`high`/`medium`/`low`), que suma
+`catalog_files`.
 
 A diferencia de `data/catalog.sqlite` (que sí contiene rutas reales),
 `reports/organization_plan.json` nunca contiene rutas: solo ids opacos
@@ -566,16 +606,29 @@ personas. Los duplicados exactos (`exact_duplicate`) y grupos visuales
 (`visual_similar_group`) son solo flags informativos: no se propone
 borrado ni se elige copia principal.
 
+### Uso
+
 ```bash
 python -m local_file_organizer organize-preview
 python -m local_file_organizer organize-preview --db data/catalog.sqlite --plan-path reports/organization_plan.json
+python -m local_file_organizer organize-preview --decisions data/face_review_decisions.json
 ```
 
-Flags: `--db`, `--plan-path`, `--show-files`, `--quiet`. `--show-files`
-muestra las rutas reales bajo cada destino y es solo para que lo ejecutes
-tú manualmente: Claude/Muse nunca debe invocarlo contra datos personales
-reales durante una sesión de desarrollo (la salida por defecto nunca
-contiene rutas).
+Flags: `--db`, `--plan-path`, `--decisions`, `--show-files`, `--quiet`.
+`--decisions` apunta al JSON exportado por `face-review` (V2.4.1): las
+decisiones humanas anulan la heurística; un archivo ausente equivale a no
+tener decisiones y un JSON inválido aborta con `ERROR:` y exit code 1.
+`--show-files` muestra las rutas reales bajo cada destino y es solo para
+que lo ejecutes tú manualmente: Claude/Muse nunca debe invocarlo contra
+datos personales reales durante una sesión de desarrollo (la salida por
+defecto nunca contiene rutas).
+
+La salida agrupa los destinos (`Media/`, `Revisión/` justo después,
+`Documentos/`, `Audio/`, `Archivos_comprimidos/`, `Software/`, `Otros/`)
+y añade `=== DESTINATIONS ===` (archivos por prefijo:
+`person_destinations`, `pair_destinations`, `group_destinations`,
+`review_destinations`, `sin_personas`) y `=== CONFIDENCE ===`
+(`high`/`medium`/`low`) antes del bloque `=== ACCOUNTING ===`.
 
 Limitación conocida: una imagen/video que nunca pasó por
 `detect-faces`/`cluster-people` (sin filas en `person_cluster_members`)
@@ -627,8 +680,13 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   `rejected`/`uncertain`), sin auto-merge.
 - V2.5 (implementado): vista previa de organización read-only
   (`organize-preview`, `reports/organization_plan.json`), pares/grupos de
-  coocurrencia (`PAIR_000N`/`GROUP_000N`). V2.6 (`organize-apply`,
-  movimientos reales) no existe todavía.
+  coocurrencia (`PAIR_000N`/`GROUP_000N`).
+- V2.5.1 (implementado): routing por confianza `high`/`medium`/`low` en la
+  vista previa; singletons y evidencia débil a `Revisión/`
+  (`Baja_evidencia/`, `Persona_incierta/`, `Cluster_rechazado/`), override
+  humano de V2.4.1 vía `--decisions` y bloques `DESTINATIONS`/`CONFIDENCE`.
+- V2.6 (no implementado): `organize-apply`, movimientos reales con
+  dry-run/rollback; no existe todavía.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.

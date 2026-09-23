@@ -911,15 +911,23 @@ def run_cluster_people(
 def run_organize_preview(
     db_path: Path = DEFAULT_DB_PATH,
     plan_path: Path = DEFAULT_PLAN_PATH,
+    decisions_path: Path = DEFAULT_FACE_REVIEW_DECISIONS,
     show_files: bool = False,
     quiet: bool = False,
 ) -> None:
     """Build the read-only organization preview from the SQLite catalog.
 
-    Only reads the catalog database and writes ``reports/organization_plan.json``;
-    never walks the filesystem or touches the scanned tree.
+    Only reads the catalog database and the local human decisions file, and
+    writes ``reports/organization_plan.json``; never walks the filesystem or
+    touches the scanned tree. A missing decisions file means no decisions.
     """
     from .organization_plan import (
+        DESTINATION_REVIEW_LOW_EVIDENCE,
+        DESTINATION_REVIEW_METADATA,
+        DESTINATION_REVIEW_REJECTED,
+        DESTINATION_REVIEW_SCAN,
+        DESTINATION_REVIEW_UNCERTAIN,
+        DESTINATION_SIN_PERSONAS,
         build_organization_plan,
         plan_counts,
         write_plan_json,
@@ -949,7 +957,14 @@ def run_organize_preview(
         conn.close()
         raise SystemExit(1)
 
-    entries = build_organization_plan(conn)
+    try:
+        decisions = load_decisions(decisions_path)
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: decisiones inválidas: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    entries = build_organization_plan(conn, decisions=decisions)
     counts = plan_counts(entries)
     by_destination: dict[str, int] = counts["by_destination"]
     write_plan_json(entries, plan_path)
@@ -982,7 +997,7 @@ def run_organize_preview(
         grupos = sorted(
             (d, c) for d, c in media_dests.items() if d.startswith("Media/Grupos/")
         )
-        sin = media_dests.get("Media/Sin_personas/")
+        sin = media_dests.get(DESTINATION_SIN_PERSONAS)
         if personas:
             lines.append("  Personas/")
             for dest, c in personas:
@@ -1011,9 +1026,28 @@ def run_organize_preview(
             lines.append(f"  {_leaf_line('Sin_personas/', sin)}")
             if show_files:
                 for p in sorted(
-                    paths_by_destination.get("Media/Sin_personas/", [])
+                    paths_by_destination.get(DESTINATION_SIN_PERSONAS, [])
                 ):
                     lines.append(f"      - {p}")
+        lines.append("")
+
+    revision = {d: c for d, c in by_destination.items() if d.startswith("Revisión/")}
+    if revision:
+        lines.append("Revisión/")
+        for label, dest in (
+            ("Persona_incierta/", DESTINATION_REVIEW_UNCERTAIN),
+            ("Cluster_rechazado/", DESTINATION_REVIEW_REJECTED),
+            ("Baja_evidencia/", DESTINATION_REVIEW_LOW_EVIDENCE),
+            ("Metadata_incompleta/", DESTINATION_REVIEW_METADATA),
+            ("Errores_de_escaneo/", DESTINATION_REVIEW_SCAN),
+        ):
+            n = revision.get(dest)
+            if not n:
+                continue
+            lines.append(f"  {_leaf_line(label, n)}")
+            if show_files:
+                for p in sorted(paths_by_destination.get(dest, [])):
+                    lines.append(f"    - {p}")
         lines.append("")
 
     documentos = sorted(
@@ -1071,30 +1105,36 @@ def run_organize_preview(
                     lines.append(f"    - {p}")
         lines.append("")
 
-    revision = {d: c for d, c in by_destination.items() if d.startswith("Revisión/")}
-    if revision:
-        lines.append("Revisión/")
-        if revision.get("Revisión/Metadata_incompleta/"):
-            n = revision["Revisión/Metadata_incompleta/"]
-            lines.append(f"  {_leaf_line('Metadata_incompleta/', n)}")
-            if show_files:
-                for p in sorted(
-                    paths_by_destination.get("Revisión/Metadata_incompleta/", [])
-                ):
-                    lines.append(f"    - {p}")
-        if revision.get("Revisión/Errores_de_escaneo/"):
-            n = revision["Revisión/Errores_de_escaneo/"]
-            lines.append(f"  {_leaf_line('Errores_de_escaneo/', n)}")
-            if show_files:
-                for p in sorted(
-                    paths_by_destination.get("Revisión/Errores_de_escaneo/", [])
-                ):
-                    lines.append(f"    - {p}")
-        lines.append("")
+    person_destinations = sum(
+        c for d, c in by_destination.items() if d.startswith("Media/Personas/")
+    )
+    pair_destinations = sum(
+        c for d, c in by_destination.items() if d.startswith("Media/Parejas/")
+    )
+    group_destinations = sum(
+        c for d, c in by_destination.items() if d.startswith("Media/Grupos/")
+    )
+    review_destinations = sum(
+        c for d, c in by_destination.items() if d.startswith("Revisión/")
+    )
+    sin_personas = by_destination.get(DESTINATION_SIN_PERSONAS, 0)
 
     lines.append("FLAGS:")
     lines.append(f"exact_duplicates={counts['exact_duplicates']}")
     lines.append(f"visual_similar_groups={counts['visual_similar_groups']}")
+    lines.append("")
+    lines.append("=== DESTINATIONS ===")
+    lines.append(f"person_destinations={person_destinations}")
+    lines.append(f"pair_destinations={pair_destinations}")
+    lines.append(f"group_destinations={group_destinations}")
+    lines.append(f"review_destinations={review_destinations}")
+    lines.append(f"sin_personas={sin_personas}")
+    lines.append("")
+    lines.append("=== CONFIDENCE ===")
+    confidence = counts["confidence_levels"]
+    lines.append(f"high={confidence['high']}")
+    lines.append(f"medium={confidence['medium']}")
+    lines.append(f"low={confidence['low']}")
     lines.append("")
     lines.append("=== ACCOUNTING ===")
     lines.append(f"catalog_files={counts['catalog_files']}")
@@ -1553,6 +1593,16 @@ def build_parser() -> argparse.ArgumentParser:
     preview_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     preview_parser.add_argument("--plan-path", type=Path, default=DEFAULT_PLAN_PATH)
     preview_parser.add_argument(
+        "--decisions",
+        type=Path,
+        default=DEFAULT_FACE_REVIEW_DECISIONS,
+        help=(
+            "Decisiones humanas de la revisión de clusters (V2.4.1) que "
+            "anulan la confianza heurística; un archivo ausente equivale a "
+            "no tener decisiones."
+        ),
+    )
+    preview_parser.add_argument(
         "--show-files",
         action="store_true",
         help=(
@@ -1663,6 +1713,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         run_organize_preview(
             db_path=args.db,
             plan_path=args.plan_path,
+            decisions_path=args.decisions,
             show_files=args.show_files,
             quiet=args.quiet,
         )
