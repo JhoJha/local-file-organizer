@@ -1,0 +1,66 @@
+"""CSV export and human-readable summaries. Only ever writes under the
+project's own reports/ directory, never into the scanned tree."""
+from __future__ import annotations
+
+import csv
+import sqlite3
+from pathlib import Path
+
+from .metadata import human_readable_size
+
+CSV_COLUMNS = [
+    "path", "name", "extension", "category", "size_bytes", "size_human",
+    "modified_at", "mime_type", "sha256", "duplicate_group",
+    "duration_seconds", "width", "height", "fps", "video_codec",
+    "audio_codec", "bitrate", "scan_status", "scan_error",
+    "metadata_status", "metadata_error",
+]
+
+
+def export_csv(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Write the full catalog to a CSV file. Returns the row count."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    cur = conn.execute("SELECT * FROM files ORDER BY category, path")
+    rows = cur.fetchall()
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            row_dict = dict(row)
+            row_dict["size_human"] = human_readable_size(row_dict["size_bytes"] or 0)
+            writer.writerow({key: row_dict.get(key) for key in CSV_COLUMNS})
+    return len(rows)
+
+
+def build_summary_text(
+    category_totals,
+    total_files: int,
+    total_bytes: int,
+    duplicate_file_count: int,
+    duplicate_group_count: int,
+    recoverable_bytes: int,
+    error_count: int,
+) -> str:
+    lines = ["=== RESUMEN ===", ""]
+    for row in category_totals:
+        category = row["category"]
+        count = row["count"]
+        total = row["total_bytes"] or 0
+        lines.append(f"{category:<12} {count:>6} archivos   {human_readable_size(total):>10}")
+
+    lines.append("")
+    lines.append("Total:")
+    lines.append(f"{total_files} archivos")
+    lines.append(human_readable_size(total_bytes))
+
+    lines.append("")
+    lines.append("Duplicados:")
+    lines.append(f"{duplicate_file_count} archivos en grupos duplicados")
+    lines.append(f"{duplicate_group_count} grupos")
+    lines.append(f"Espacio potencialmente recuperable: {human_readable_size(recoverable_bytes)}")
+
+    lines.append("")
+    lines.append("Errores:")
+    lines.append(f"{error_count} archivos no pudieron analizarse")
+
+    return "\n".join(lines)
