@@ -299,5 +299,98 @@ class PersonClusterMemberTests(unittest.TestCase):
         conn.close()
 
 
+class PersonClusterObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "catalog.sqlite"
+
+    def test_table_columns_exist_on_fresh_db(self):
+        conn = connect(self.db_path)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(person_cluster_observations)")
+        }
+        self.assertEqual(
+            columns,
+            {
+                "id",
+                "person_label",
+                "file_path",
+                "source_type",
+                "timestamp_ms",
+                "bbox_x",
+                "bbox_y",
+                "bbox_width",
+                "bbox_height",
+                "detection_confidence",
+            },
+        )
+        indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(person_cluster_observations)")
+        }
+        self.assertIn("idx_person_cluster_observations_label", indexes)
+        self.assertIn("idx_person_cluster_observations_path", indexes)
+        conn.close()
+
+    def test_insert_fetch_clear_all_round_trip(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_person_cluster_observations(
+            conn,
+            [
+                ("P0002", "/img/b.png", "image", None, 1, 2, 3, 4, 0.5),
+                ("P0001", "/v/clip.mp4", "video_frame", 1500.0, 5, 6, 7, 8, 0.9),
+                ("P0001", "/img/a.png", "image", None, 9, 10, 11, 12, 0.7),
+            ],
+        )
+        conn.commit()
+
+        rows = database.fetch_person_cluster_observations(conn)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(r["person_label"], r["file_path"]) for r in rows],
+            [
+                ("P0001", "/img/a.png"),
+                ("P0001", "/v/clip.mp4"),
+                ("P0002", "/img/b.png"),
+            ],
+        )
+        video_row = rows[1]
+        self.assertEqual(video_row["source_type"], "video_frame")
+        self.assertEqual(video_row["timestamp_ms"], 1500.0)
+        self.assertEqual(
+            (
+                video_row["bbox_x"],
+                video_row["bbox_y"],
+                video_row["bbox_width"],
+                video_row["bbox_height"],
+            ),
+            (5, 6, 7, 8),
+        )
+        self.assertEqual(video_row["detection_confidence"], 0.9)
+
+        filtered = database.fetch_person_cluster_observations(conn, "P0001")
+        self.assertEqual(len(filtered), 2)
+        self.assertTrue(all(r["person_label"] == "P0001" for r in filtered))
+
+        # Full-table clear (same global rebuild semantics as members).
+        database.clear_all_person_cluster_observations(conn)
+        conn.commit()
+        self.assertEqual(database.fetch_person_cluster_observations(conn), [])
+        conn.close()
+
+    def test_insert_empty_is_noop(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_person_cluster_observations(conn, [])
+        conn.commit()
+        self.assertEqual(database.fetch_person_cluster_observations(conn), [])
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ only under this project's own data/ and reports/ directories.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,18 @@ from .face_detection import (
     detect_faces_raw,
 )
 from .face_embedding import compute_embedding
+from .face_review import (
+    DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
+    DEFAULT_THUMBNAIL_MAX_PX,
+    build_manifest,
+    compute_metrics,
+    generate_assets,
+    load_decisions,
+    parse_decisions_payload,
+    save_decisions,
+    validate_decisions,
+    write_review_site,
+)
 from .hashing import DuplicateRecord, find_duplicates
 from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
 from .video_sampling import compute_sample_timestamps, sample_video_frames
@@ -50,8 +63,18 @@ DEFAULT_CSV_PATH = PROJECT_ROOT / "reports" / "inventory.csv"
 DEFAULT_PLAN_PATH = PROJECT_ROOT / "reports" / "organization_plan.json"
 DEFAULT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "snapshots"
 DEFAULT_DEBUG_FRAMES_DIR = PROJECT_ROOT / "data" / "debug_frames"
+DEFAULT_FACE_REVIEW_DIR = PROJECT_ROOT / "reports" / "face_review"
+DEFAULT_FACE_REVIEW_DECISIONS = PROJECT_ROOT / "data" / "face_review_decisions.json"
 
 _PROGRESS_INTERVAL = 500
+
+
+def _display_path(path: Path) -> str:
+    """Render a project-owned output path relative to the repo when possible."""
+    try:
+        return str(path.resolve().relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _scan_one_file(path: Path) -> database.FileRecord:
@@ -665,6 +688,7 @@ def run_cluster_people(
     conn = database.connect(db_path)
     observations: list[ClusterableObservation] = []
     file_of_obs: list[tuple[str, str]] = []  # (file_path, file_category) per observation
+    obs_details: list[tuple] = []  # per-observation detail row, parallel to file_of_obs
     face_observations_considered = 0
     processed_files = 0
 
@@ -700,6 +724,7 @@ def run_cluster_people(
                 if emb is None:
                     continue
                 x = max(0, round(float(row[0])))
+                y = max(0, round(float(row[1])))
                 observations.append(
                     ClusterableObservation(
                         key=(str(file_path), "image", -1, x),
@@ -707,6 +732,9 @@ def run_cluster_people(
                     )
                 )
                 file_of_obs.append((str(file_path), "image"))
+                obs_details.append(
+                    (str(file_path), "image", None, x, y, w, h, float(row[14]))
+                )
             if not quiet:
                 if redact_paths:
                     if processed_files % 10 == 0 or processed_files == 1:
@@ -749,6 +777,7 @@ def run_cluster_people(
                         if emb2 is None:
                             continue
                         x2 = max(0, round(float(frow2[0])))
+                        y2 = max(0, round(float(frow2[1])))
                         observations.append(
                             ClusterableObservation(
                                 key=(str(file_path), "video_frame", timestamp_ms2, x2),
@@ -756,6 +785,18 @@ def run_cluster_people(
                             )
                         )
                         file_of_obs.append((str(file_path), "video"))
+                        obs_details.append(
+                            (
+                                str(file_path),
+                                "video_frame",
+                                timestamp_ms2,
+                                x2,
+                                y2,
+                                w2,
+                                h2,
+                                float(frow2[14]),
+                            )
+                        )
 
                 sampling = sample_video_frames(
                     file_path,
@@ -797,8 +838,15 @@ def run_cluster_people(
         (label, fpath, fcat, count) for (label, fpath, fcat), count in counts_by_pair.items()
     ]
 
+    observation_rows_to_insert = [
+        (labels[obs_index],) + obs_details[obs_index]
+        for obs_index in range(len(obs_details))
+    ]
+
     database.clear_all_person_cluster_members(conn)
     database.insert_person_cluster_members(conn, rows_to_insert)
+    database.clear_all_person_cluster_observations(conn)
+    database.insert_person_cluster_observations(conn, observation_rows_to_insert)
     conn.commit()
 
     summary = database.fetch_person_cluster_summary(conn)
@@ -842,6 +890,7 @@ def run_cluster_people(
     print("=== PERSON CLUSTERING ===")
     print(f"face_observations_considered={face_observations_considered}")
     print(f"usable_embeddings={usable_embeddings}")
+    print(f"mapped_observations={len(obs_details)}")
     print(f"rejected_faces={rejected_faces}")
     print(f"person_clusters={person_clusters}")
     print()
@@ -1061,6 +1110,242 @@ def run_organize_preview(
     print("\n".join(lines))
 
 
+def run_face_review(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    output_dir: Path = DEFAULT_FACE_REVIEW_DIR,
+    decisions_path: Path = DEFAULT_FACE_REVIEW_DECISIONS,
+    max_previews_per_cluster: int = DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
+    thumb_size: int = DEFAULT_THUMBNAIL_MAX_PX,
+    quiet: bool = False,
+    verify_readonly: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+) -> None:
+    """Build a fully local visual review of the person clusters.
+
+    Reads the catalog and the scanned tree (images/frames are decoded in
+    memory only) and writes a static, offline review site plus local
+    thumbnails under ``output_dir``. Never writes inside the scanned tree.
+    """
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        print(
+            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
+            "punto de montaje o crea la carpeta esperada.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    try:
+        count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+    except Exception:
+        conn.close()
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if (count_row[0] if count_row else 0) == 0:
+        conn.close()
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # Safety: the review output must never live inside the scanned tree.
+    target_resolved = target.resolve()
+    output_resolved = output_dir.resolve()
+    if output_resolved == target_resolved or target_resolved in output_resolved.parents:
+        conn.close()
+        print(
+            "ERROR: el directorio de salida está dentro del árbol escaneado; "
+            "elige una ruta fuera de él.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if verify_readonly:
+        snapshot_resolved = snapshot_dir.resolve()
+        if (
+            snapshot_resolved == target_resolved
+            or target_resolved in snapshot_resolved.parents
+        ):
+            conn.close()
+            print(
+                "ERROR: el directorio de snapshots está dentro del árbol "
+                "escaneado; elige una ruta fuera de él.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    try:
+        decisions = load_decisions(decisions_path)
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: decisiones inválidas: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    start = time.perf_counter()
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    walk_errors: list[ScanError] = []
+
+    def _on_error(err: ScanError) -> None:
+        # Paths are deliberately not printed: the summary never leaks the
+        # scanned tree.
+        walk_errors.append(err)
+
+    before_snapshot = None
+    if verify_readonly:
+        before_snapshot = capture_snapshot(
+            target, ignored_dirs=ignored_dirs, on_error=_on_error
+        )
+        save_snapshot(before_snapshot, snapshot_dir / "before.json")
+
+    manifest, details = build_manifest(
+        conn, max_previews_per_cluster=max_previews_per_cluster
+    )
+    metrics = compute_metrics(manifest, decisions)
+    conn.close()
+
+    asset_stats = generate_assets(
+        manifest, details, output_dir / "assets", thumb_size=thumb_size
+    )
+    write_review_site(manifest, decisions, metrics, output_dir)
+
+    if verify_readonly:
+        after_snapshot = capture_snapshot(
+            target, ignored_dirs=ignored_dirs, on_error=_on_error
+        )
+        save_snapshot(after_snapshot, snapshot_dir / "after.json")
+        readonly_diff = diff_snapshots(before_snapshot, after_snapshot)
+        print()
+        print("=== VERIFICACIÓN READ-ONLY ===")
+        print(
+            f"added={len(readonly_diff.added)} removed={len(readonly_diff.removed)} "
+            f"size_changed={len(readonly_diff.size_changed)} "
+            f"mtime_changed={len(readonly_diff.mtime_changed)}"
+        )
+        if readonly_diff.is_clean:
+            print("OK: ningún archivo original cambió durante el escaneo.")
+        else:
+            print(
+                "ALERTA: se detectaron cambios en los archivos originales durante el escaneo.",
+                file=sys.stderr,
+            )
+            for label_name, paths in (
+                ("added", readonly_diff.added),
+                ("removed", readonly_diff.removed),
+                ("size_changed", readonly_diff.size_changed),
+                ("mtime_changed", readonly_diff.mtime_changed),
+            ):
+                for changed_path in paths[:20]:
+                    print(f"  [{label_name}] {changed_path}", file=sys.stderr)
+
+    elapsed_seconds = time.perf_counter() - start
+
+    print()
+    print("=== FACE REVIEW ===")
+    print(f"clusters={len(manifest['clusters'])}")
+    print("review_pages=1")
+    print(f"thumbnails={asset_stats['thumbnails']}")
+    print(f"assets_bytes={asset_stats['assets_bytes']}")
+    print(f"errors={asset_stats['errors']}")
+    print(f"singleton_clusters={metrics['singleton_clusters']}")
+    print(f"multi_file_clusters={metrics['multi_file_clusters']}")
+    print(f"cross_media_clusters={metrics['cross_media_clusters']}")
+    print(f"reviewed={metrics['reviewed']}")
+    print(f"confirmed={metrics['confirmed']}")
+    print(f"rejected={metrics['rejected']}")
+    print(f"uncertain={metrics['uncertain']}")
+    print(f"unreviewed={metrics['unreviewed']}")
+    print(f"output={_display_path(output_dir / 'index.html')}")
+    print(f"manifest={_display_path(output_dir / 'manifest.json')}")
+    print(f"elapsed_seconds={elapsed_seconds:.2f}")
+
+
+def run_face_review_import(
+    decisions_file: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    decisions_path: Path = DEFAULT_FACE_REVIEW_DECISIONS,
+    quiet: bool = False,
+) -> None:
+    """Import human review decisions, validating labels against the catalog.
+
+    On any validation error nothing is written: the existing decisions file
+    stays untouched.
+    """
+    if not decisions_file.exists():
+        print(
+            f"ERROR: no existe el archivo de decisiones: {decisions_file}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    try:
+        payload = json.loads(decisions_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: JSON de decisiones inválido: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        imported = parse_decisions_payload(payload)
+    except ValueError as exc:
+        print(f"ERROR: JSON de decisiones inválido: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    known_labels = {
+        row["person_label"]
+        for row in conn.execute(
+            "SELECT DISTINCT person_label FROM person_cluster_members"
+        ).fetchall()
+    }
+    conn.close()
+
+    errors = validate_decisions(imported, known_labels)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        existing = load_decisions(decisions_path)
+    except ValueError as exc:
+        print(f"ERROR: decisiones locales inválidas: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    merged = dict(existing)
+    merged.update(imported)
+    save_decisions(decisions_path, merged)
+
+    counts = {"confirmed": 0, "rejected": 0, "uncertain": 0}
+    for value in merged.values():
+        if value in counts:
+            counts[value] += 1
+
+    print()
+    print("=== FACE REVIEW IMPORT ===")
+    print(f"imported={len(imported)}")
+    print(f"confirmed={counts['confirmed']}")
+    print(f"rejected={counts['rejected']}")
+    print(f"uncertain={counts['uncertain']}")
+    print(f"total_reviewed={sum(counts.values())}")
+    print(f"decisions_file={_display_path(decisions_path)}")
+
+
 def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     if not db_path.exists():
         print(
@@ -1278,6 +1563,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preview_parser.add_argument("--quiet", action="store_true")
 
+    review_parser = subparsers.add_parser(
+        "face-review",
+        help="Revisión visual local de clusters de personas (todo offline).",
+    )
+    review_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    review_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    review_parser.add_argument(
+        "--output-dir", type=Path, default=DEFAULT_FACE_REVIEW_DIR
+    )
+    review_parser.add_argument(
+        "--decisions", type=Path, default=DEFAULT_FACE_REVIEW_DECISIONS
+    )
+    review_parser.add_argument(
+        "--max-previews-per-cluster",
+        type=int,
+        default=DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
+    )
+    review_parser.add_argument("--thumb-size", type=int, default=DEFAULT_THUMBNAIL_MAX_PX)
+    review_parser.add_argument("--verify-readonly", action="store_true")
+    review_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    review_parser.add_argument("--quiet", action="store_true")
+
+    review_import_parser = subparsers.add_parser(
+        "face-review-import",
+        help="Importar decisiones humanas de la revisión de clusters.",
+    )
+    review_import_parser.add_argument(
+        "decisions_file", type=Path, help="JSON exportado desde la revisión."
+    )
+    review_import_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    review_import_parser.add_argument(
+        "--decisions", type=Path, default=DEFAULT_FACE_REVIEW_DECISIONS
+    )
+    review_import_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -1344,6 +1664,25 @@ def main(argv: Optional[list[str]] = None) -> None:
             db_path=args.db,
             plan_path=args.plan_path,
             show_files=args.show_files,
+            quiet=args.quiet,
+        )
+    elif args.command == "face-review":
+        run_face_review(
+            target=args.target,
+            db_path=args.db,
+            output_dir=args.output_dir,
+            decisions_path=args.decisions,
+            max_previews_per_cluster=args.max_previews_per_cluster,
+            thumb_size=args.thumb_size,
+            quiet=args.quiet,
+            verify_readonly=args.verify_readonly,
+            snapshot_dir=args.snapshot_dir,
+        )
+    elif args.command == "face-review-import":
+        run_face_review_import(
+            decisions_file=args.decisions_file,
+            db_path=args.db,
+            decisions_path=args.decisions,
             quiet=args.quiet,
         )
 

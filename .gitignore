@@ -13,6 +13,10 @@ reports/*.json
 data/snapshots/
 data/debug_frames/
 
+# V2.4.1 face-cluster review: local thumbnails and human decisions.
+reports/face_review/
+data/face_review_decisions.json
+
 __pycache__/
 *.pyc
 .pytest_cache/

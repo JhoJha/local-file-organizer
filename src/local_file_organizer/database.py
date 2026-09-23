@@ -71,6 +71,20 @@ CREATE TABLE IF NOT EXISTS person_cluster_members (
 );
 CREATE INDEX IF NOT EXISTS idx_person_cluster_members_label ON person_cluster_members(person_label);
 CREATE INDEX IF NOT EXISTS idx_person_cluster_members_path ON person_cluster_members(file_path);
+CREATE TABLE IF NOT EXISTS person_cluster_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_label TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    timestamp_ms REAL,
+    bbox_x INTEGER NOT NULL,
+    bbox_y INTEGER NOT NULL,
+    bbox_width INTEGER NOT NULL,
+    bbox_height INTEGER NOT NULL,
+    detection_confidence REAL
+);
+CREATE INDEX IF NOT EXISTS idx_person_cluster_observations_label ON person_cluster_observations(person_label);
+CREATE INDEX IF NOT EXISTS idx_person_cluster_observations_path ON person_cluster_observations(file_path);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -472,3 +486,46 @@ def fetch_person_cluster_summary(conn: sqlite3.Connection) -> list[dict]:
             }
         )
     return result
+
+
+def clear_all_person_cluster_observations(conn: sqlite3.Connection) -> None:
+    """Delete ALL person_cluster_observations rows (full rebuild semantics).
+
+    Same global/relative-operation rationale as
+    `clear_all_person_cluster_members`: each `cluster-people` run rebuilds
+    the whole observation map from scratch, since cluster labels are only
+    meaningful relative to the whole batch.
+    """
+    conn.execute("DELETE FROM person_cluster_observations")
+
+
+def insert_person_cluster_observations(conn: sqlite3.Connection, rows: list) -> None:
+    """Bulk-insert (person_label, file_path, source_type, timestamp_ms,
+    bbox_x, bbox_y, bbox_width, bbox_height, detection_confidence) tuples."""
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT INTO person_cluster_observations "
+        "(person_label, file_path, source_type, timestamp_ms, "
+        "bbox_x, bbox_y, bbox_width, bbox_height, detection_confidence) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        list(rows),
+    )
+
+
+def fetch_person_cluster_observations(
+    conn: sqlite3.Connection, person_label: Optional[str] = None
+):
+    """Fetch observation rows globally or for one person_label."""
+    if person_label is None:
+        cur = conn.execute(
+            "SELECT * FROM person_cluster_observations "
+            "ORDER BY person_label, file_path, timestamp_ms, bbox_x, id"
+        )
+    else:
+        cur = conn.execute(
+            "SELECT * FROM person_cluster_observations WHERE person_label = ? "
+            "ORDER BY person_label, file_path, timestamp_ms, bbox_x, id",
+            (person_label,),
+        )
+    return cur.fetchall()

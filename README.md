@@ -1,4 +1,4 @@
-# local-file-organizer (V2.4 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo)
+# local-file-organizer (V2.4.1 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo + revisión de clusters)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -37,6 +37,11 @@ servicios en la nube ni usa IA generativa.
     pertenencia (persona, archivo) en `person_cluster_members` — ver
     [Embeddings faciales y clustering anónimo de personas
     (V2.4)](#embeddings-faciales-y-clustering-anónimo-de-personas-v24).
+13. (V2.4.1) `face-review` genera una revisión visual local de los
+    clusters (miniaturas + HTML estático sin red) y
+    `face-review-import` importa las decisiones humanas — ver
+    [Revisión de clusters de personas
+    (V2.4.1)](#revisión-de-clusters-de-personas-v241).
 
 ## Qué NO hace (por diseño)
 
@@ -79,6 +84,8 @@ python -m local_file_organizer similar-images
 python -m local_file_organizer sample-frames /ruta/a/analizar
 python -m local_file_organizer detect-faces /ruta/a/analizar
 python -m local_file_organizer cluster-people /ruta/a/analizar
+python -m local_file_organizer face-review /ruta/a/analizar
+python -m local_file_organizer face-review-import review_decisions.json
 python -m local_file_organizer organize-preview
 ```
 
@@ -451,6 +458,62 @@ rechazadas, número de clusters de persona, una línea `P000N files=…
 images=… videos=…` por persona, archivos con coocurrencia de exactamente
 2 personas y segundos transcurridos.
 
+## Revisión de clusters de personas (V2.4.1)
+
+`cluster-people` etiqueta personas anónimas, pero calibrar el umbral (¿son
+la misma persona o dos?) es un juicio humano. `face-review` genera una
+página local para revisarlo visualmente y `face-review-import` incorpora
+las decisiones — todo 100% local/offline, sin red, y sin tocar el árbol
+escaneado.
+
+```bash
+python -m local_file_organizer face-review /ruta/a/analizar
+python -m local_file_organizer face-review-import review_decisions.json
+```
+
+`face-review` escribe bajo `reports/face_review/` (ignorado por git):
+
+```text
+reports/face_review/
+├── index.html          # página estática, CSS/JS inline, sin recursos remotos
+├── manifest.json       # clusters + previews con ids opacos (sin rutas reales)
+└── assets/             # miniaturas JPEG locales (P0001_01.jpg, …)
+```
+
+Privacidad: todo se genera en local. Las miniaturas solo se escriben bajo
+`reports/face_review/` (nunca dentro del árbol escaneado; si `--output-dir`
+cae dentro del target, el comando aborta), el HTML no tiene ningún recurso
+remoto (sin `http(s)`, sin CDN, sin fuentes externas, sin `fetch`), y ni
+`index.html` ni `manifest.json` contienen rutas reales — solo ids opacos
+`F000NNN`/`O000NNN` y etiquetas `P000N`. Los frames de video se muestrean
+efímeramente, como en V2.2.
+
+Flujo de decisiones:
+
+1. Abre `reports/face_review/index.html` en tu navegador y marca cada
+   cluster: **Misma persona** (`confirmed`), **Personas distintas**
+   (`rejected`), **No seguro** (`uncertain`) o **Limpiar**
+   (`unreviewed`). El progreso se guarda en `localStorage` del navegador.
+2. Pulsa **Exportar decisiones JSON**: descarga `review_decisions.json`
+   (solo clusters decididos).
+3. Impórtalo con `face-review-import FILE`, que valida la versión y que
+   todos los labels existan en el catálogo actual antes de escribir
+   `data/face_review_decisions.json` (si algo falla, no escribe nada).
+   Lo importado pisa lo existente y el resto se conserva.
+4. `face-review` lee ese archivo y muestra el contador de revisión
+   (`reviewed`, `confirmed`, `rejected`, `uncertain`, `unreviewed`).
+
+Estados permitidos: `confirmed`, `rejected`, `uncertain` (y `unreviewed`
+para limpiar). **No hay auto-merge**: las decisiones son solo anotaciones
+humanas locales; ningún comando fusiona, divide, mueve ni renombra
+clusters o archivos automáticamente.
+
+Opciones de `face-review`: `--db`, `--output-dir`, `--decisions`,
+`--max-previews-per-cluster` (por defecto `6`), `--thumb-size` (por
+defecto `192` px), `--verify-readonly`, `--snapshot-dir`, `--quiet`.
+`face-review-import` acepta `decisions_file`, `--db`, `--decisions` y
+`--quiet`.
+
 ## Modelo de errores por archivo
 
 Cada fila en `files` distingue dos fallos independientes:
@@ -558,6 +621,10 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   persistidos) y clustering anónimo de personas (`cluster-people`, tabla
   `person_cluster_members`, etiquetas `P0001`, …); agrupa quién-aparece-
   dónde sin identificar a nadie.
+- V2.4.1 (implementado): revisión visual local de clusters
+  (`face-review`/`face-review-import`, `reports/face_review/`, tabla
+  `person_cluster_observations`); anotaciones humanas (`confirmed`/
+  `rejected`/`uncertain`), sin auto-merge.
 - V2.5 (implementado): vista previa de organización read-only
   (`organize-preview`, `reports/organization_plan.json`), pares/grupos de
   coocurrencia (`PAIR_000N`/`GROUP_000N`). V2.6 (`organize-apply`,
