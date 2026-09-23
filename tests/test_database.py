@@ -231,5 +231,73 @@ class FaceObservationTests(unittest.TestCase):
         conn.close()
 
 
+class PersonClusterMemberTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "catalog.sqlite"
+
+    def test_insert_clear_all_fetch_round_trip(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_person_cluster_members(
+            conn,
+            [
+                ("P0001", "/img/a.png", "image", 1),
+                ("P0001", "/v/clip.mp4", "video", 5),
+                ("P0002", "/img/b.png", "image", 2),
+            ],
+        )
+        conn.commit()
+
+        summary = database.fetch_person_cluster_summary(conn)
+        self.assertEqual(len(summary), 2)
+        by_label = {row["person_label"]: row for row in summary}
+        self.assertEqual(
+            by_label["P0001"], {"person_label": "P0001", "files": 2, "images": 1, "videos": 1}
+        )
+        self.assertEqual(
+            by_label["P0002"], {"person_label": "P0002", "files": 1, "images": 1, "videos": 0}
+        )
+
+        # Full-table clear (NOT scoped to one file_path — different from
+        # every other clear function in this codebase, which are per-file).
+        database.clear_all_person_cluster_members(conn)
+        conn.commit()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM person_cluster_members").fetchone()[0], 0
+        )
+        self.assertEqual(database.fetch_person_cluster_summary(conn), [])
+        conn.close()
+
+    def test_clear_all_removes_other_files_rows_too(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_person_cluster_members(
+            conn,
+            [
+                ("P0001", "/img/a.png", "image", 1),
+                ("P0002", "/img/b.png", "image", 1),
+            ],
+        )
+        conn.commit()
+        database.clear_all_person_cluster_members(conn)
+        conn.commit()
+        remaining = conn.execute("SELECT COUNT(*) FROM person_cluster_members").fetchone()[0]
+        self.assertEqual(remaining, 0)
+        conn.close()
+
+    def test_insert_empty_is_noop(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_person_cluster_members(conn, [])
+        conn.commit()
+        self.assertEqual(database.fetch_person_cluster_summary(conn), [])
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

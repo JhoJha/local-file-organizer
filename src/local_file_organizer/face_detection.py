@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = PROJECT_ROOT / "models" / "face_detection_yunet_2023mar.onnx"
@@ -69,6 +70,35 @@ def get_face_detector(
     return _detector_cache[key]
 
 
+def detect_faces_raw(
+    path: Path, *, confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
+) -> tuple[int, int, Optional[np.ndarray], Optional[str]]:
+    """Detect faces and return the raw YuNet detection rows, never raising.
+
+    Returns (width, height, rows, error). rows is cv2's raw Nx15 float
+    array (or None if no faces / on error) — NOT filtered by min_face_size,
+    NOT converted to FaceObservation. Same read-only, never-raises contract
+    as detect_faces_in_image_file: any failure comes back as `error` with
+    rows=None, width=height=0.
+    """
+    try:
+        img = cv2.imread(str(path))
+        if img is None:
+            return (0, 0, None, "could not decode image")
+        height, width = img.shape[0], img.shape[1]
+        detector = get_face_detector(confidence_threshold=confidence_threshold)
+        detector.setInputSize((width, height))
+        _retval, faces = detector.detect(img)
+        if faces is None:
+            return (width, height, None, None)
+        rows = np.asarray(faces, dtype=np.float32)
+        if rows.size == 0:
+            return (width, height, None, None)
+        return (width, height, rows, None)
+    except Exception as exc:  # one bad file must never crash the batch
+        return (0, 0, None, str(exc))
+
+
 def detect_faces_in_image_file(
     path: Path,
     *,
@@ -81,18 +111,14 @@ def detect_faces_in_image_file(
     ``FaceDetectionResult.error`` with ``faces == []``.
     """
     try:
-        img = cv2.imread(str(path))
-        if img is None:
-            return FaceDetectionResult(
-                width=0, height=0, faces=[], error="could not decode image"
-            )
-        height, width = img.shape[0], img.shape[1]
-        detector = get_face_detector(confidence_threshold=confidence_threshold)
-        detector.setInputSize((width, height))
-        _retval, faces = detector.detect(img)
+        width, height, rows, error = detect_faces_raw(
+            path, confidence_threshold=confidence_threshold
+        )
+        if error is not None:
+            return FaceDetectionResult(width=0, height=0, faces=[], error=error)
         observations: list[FaceObservation] = []
-        if faces is not None:
-            for row in faces:
+        if rows is not None:
+            for row in rows:
                 # cv2 returns Nx15 floats: columns 0-3 are x, y, w, h bbox,
                 # column 14 is the confidence score.
                 x = max(0, round(float(row[0])))

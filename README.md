@@ -1,4 +1,4 @@
-# local-file-organizer (V2.3 — inventario read-only + similitud visual + muestreo de frames + detección facial)
+# local-file-organizer (V2.4 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -32,16 +32,20 @@ servicios en la nube ni usa IA generativa.
     en frames muestreados de video, y guarda solo números (bbox +
     confianza) en `face_observations` — ver
     [Detección facial local (V2.3)](#detección-facial-local-v23).
+12. (V2.4) `cluster-people` calcula embeddings faciales y los agrupa en
+    personas anónimas (`P0001`, `P0002`, …), guardando solo la
+    pertenencia (persona, archivo) en `person_cluster_members` — ver
+    [Embeddings faciales y clustering anónimo de personas
+    (V2.4)](#embeddings-faciales-y-clustering-anónimo-de-personas-v24).
 
 ## Qué NO hace (por diseño)
 
 No mueve, copia, renombra ni borra archivos; no modifica metadatos ni
 timestamps originales; no usa IA generativa ni APIs externas; no sube nada
-a la nube; no hace reconocimiento facial: V2.3 *detecta* regiones con
-forma de cara (que *hay* una cara en tal bbox con tal confianza) pero
-sigue sin *reconocer* ni identificar quién es nadie — no hay nombres,
-embeddings ni IDs de persona (eso queda para V2.4); no reorganiza
-carpetas.
+a la nube; no hace identificación de personas reales: V2.4 agrupa caras en
+etiquetas anónimas de cluster (`P0001`, `P0002`, …) sin nombres ni
+búsquedas contra nada externo — solo quién-aparece-dónde, nunca quién-es;
+no reorganiza carpetas.
 
 ## Requisitos
 
@@ -74,6 +78,7 @@ python -m local_file_organizer duplicates
 python -m local_file_organizer similar-images
 python -m local_file_organizer sample-frames /ruta/a/analizar
 python -m local_file_organizer detect-faces /ruta/a/analizar
+python -m local_file_organizer cluster-people /ruta/a/analizar
 ```
 
 Opciones de `scan`:
@@ -120,6 +125,27 @@ Opciones de `detect-faces`:
   estrategia de muestreo de V2.2 (por defecto `30`).
 - `--redact-paths` — no imprime rutas por archivo, solo el bloque agregado
   final.
+- `--verify-readonly` — igual que en `scan`: snapshot antes/después y
+  bloque `=== VERIFICACIÓN READ-ONLY ===`.
+- `--snapshot-dir RUTA` — dónde guardar `before.json`/`after.json` (por
+  defecto `data/snapshots/`).
+- `--quiet` — reduce mensajes de progreso.
+
+Opciones de `cluster-people`:
+
+- `--db RUTA` — ruta del catálogo SQLite (por defecto `data/catalog.sqlite`).
+- `--similarity-threshold F` — similitud coseno mínima (0-1) para
+  considerar dos caras la misma persona (por defecto `0.50`; mayor = más
+  estricto / menos fusiones). OJO: dirección opuesta a la de `scan
+  --similarity-threshold`, que es una distancia Hamming donde menor = más
+  estricto.
+- `--confidence-threshold F` — reenviado a la detección facial (por
+  defecto `0.6`).
+- `--min-face-size N` — reenviado a la detección facial (por defecto `20`).
+- `--max-video-samples N` — tope de frames por video, pasado a la
+  estrategia de muestreo de V2.2 (por defecto `30`).
+- `--redact-paths` — no imprime rutas por archivo; las etiquetas
+  `P0001`, etc. no son rutas y se imprimen igual.
 - `--verify-readonly` — igual que en `scan`: snapshot antes/después y
   bloque `=== VERIFICACIÓN READ-ONLY ===`.
 - `--snapshot-dir RUTA` — dónde guardar `before.json`/`after.json` (por
@@ -333,7 +359,96 @@ transcurridos.
 
 Este hito **no** identifica ni nombra a nadie: solo detecta que *existe*
 una región con forma de cara. Los embeddings y el clustering de personas
-(quién es quién) quedan explícitamente para V2.4.
+(quién es quién) viven en V2.4 (ver abajo).
+
+## Embeddings faciales y clustering anónimo de personas (V2.4)
+
+Para cada cara detectada (con el mismo YuNet de V2.3) en imágenes y en
+frames muestreados de video, `cluster-people` calcula un embedding facial
+y agrupa los embeddings en personas anónimas — sin enviar ninguna imagen,
+frame, embedding, hash ni ruta a ningún servicio externo.
+
+### Backend: `cv2.FaceRecognizerSF` + modelo SFace vendoreado, 100% local
+
+El embedding lo produce `cv2.FaceRecognizerSF` (OpenCV) con el modelo
+SFace `face_recognition_sface_2021dec.onnx`, vendoreado en `models/`
+(38696353 bytes, SHA-256
+`0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`,
+origen: `https://github.com/opencv/opencv_zoo`,
+`models/face_recognition_sface/face_recognition_sface_2021dec.onnx`). El
+modelo viaja dentro del repo: en tiempo de clustering no hay ninguna
+llamada de red. Cada embedding es un vector de 128 dimensiones (`float32`).
+
+### Decisión crítica de privacidad: los embeddings NUNCA se persisten
+
+Los embeddings son el dato derivado más sensible de todo el pipeline (lo
+más parecido a un identificador biométrico que este proyecto produce). A
+la escala de este proyecto (unos cientos de observaciones de caras),
+recalcularlos desde cero en cada ejecución de `cluster-people` es barato,
+así que no hay ningún coste funcional real en *no* cachearlos. Por eso
+los embeddings viven solo como arrays `numpy` transitorios en memoria
+durante una única ejecución de `cluster-people`, se usan para construir
+los clusters y se descartan en cuanto esa ejecución termina. **Nunca se
+escribe un vector de embedding en SQLite, en un archivo ni en
+stdout/logs, bajo ninguna flag.** Solo se persiste el resultado
+derivado y anónimo del clustering (una etiqueta de persona y en qué
+archivos aparece). Esto es deliberadamente más conservador de lo
+estrictamente necesario.
+
+### Algoritmo de clustering: greedy complete-linkage sobre distancia coseno
+
+El clustering es greedy complete-linkage sobre distancia coseno
+(`1 - similitud coseno`): cada observación se une al *primer* cluster
+existente cuya distancia a **todos** sus miembros actuales esté dentro
+del umbral; si no, empieza un cluster nuevo. Es la misma forma
+algorítmica que el agrupamiento de V2.1
+(`perceptual_hash.group_similar_images`) y comparte su justificación
+anti-fusión-transitiva: A~B y B~C **no** obligan a juntar A, B y C si A y
+C no están entre sí dentro del umbral (un union-find / componentes
+conexas sí los fusionaría: eso es justo lo que se evita). Con una
+diferencia deliberada respecto a V2.1: aquí **toda** observación termina
+con alguna etiqueta de persona, incluso si es la única observación de esa
+persona en todo el dataset (una persona vista una vez sigue siendo
+`P0001`, no queda sin etiquetar) — este hito trata de identidad, no solo
+de agrupar similitudes. Los clusters de tamaño 1 se conservan.
+
+### Umbral de similitud
+
+El ejemplo oficial de SFace de OpenCV usa un umbral de similitud coseno
+de 0.363 (calibrado en LFW para equilibrar precisión/recuperación). Este
+proyecto exige deliberadamente una similitud *mayor* (más estricta):
+**0.50** (`--similarity-threshold`, configurable en `cluster-people`),
+porque el requisito de producto es que "los falsos positivos [fusionar
+erróneamente a dos personas distintas] son peores que los falsos
+negativos [dividir a una persona en dos clusters]": subir la barra de lo
+que cuenta como "la misma persona" cambia algunas divisiones de más por
+menos fusiones indebidas, que es la dirección explícitamente deseada.
+Nótese la diferencia con V2.1: allí `--similarity-threshold` es una
+distancia Hamming donde *menor* = más estricto; aquí es una similitud
+coseno donde *mayor* = más estricto. No asumir que ambas flags funcionan
+igual.
+
+### Etiquetas anónimas y qué se guarda
+
+Cada cluster recibe una etiqueta anónima `P0001`, `P0002`, … (asignación
+determinista: mismo input → mismos clusters → mismas etiquetas). No hay
+nombres, no hay identificación de personas reales, no hay búsquedas
+contra nada externo. Cada ejecución de `cluster-people` reconstruye por
+completo la tabla `person_cluster_members` (una fila por cada par
+distinto persona-archivo, con `file_category` — `'image'` o `'video'` —
+y `observation_count`, cuántas observaciones de ese archivo cayeron en
+esa persona): el clustering es una operación global/relativa sobre todo
+el lote, no algo actualizable incrementalmente por archivo.
+
+```bash
+python -m local_file_organizer cluster-people /ruta/a/analizar
+```
+
+El resumen final (`=== PERSON CLUSTERING ===`) solo muestra agregados,
+nunca rutas: observaciones consideradas, embeddings utilizables,
+rechazadas, número de clusters de persona, una línea `P000N files=…
+images=… videos=…` por persona, archivos con coocurrencia de exactamente
+2 personas y segundos transcurridos.
 
 ## Modelo de errores por archivo
 
@@ -388,7 +503,12 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   tabla `video_frame_samples`); sin detección facial todavía.
 - V2.3 (implementado): detección facial local (`detect-faces`, tabla
   `face_observations`); detecta regiones, no identifica personas.
-- V2.4+: embeddings faciales, clustering de personas.
+- V2.4 (implementado): embeddings faciales (SFace vendoreado, nunca
+  persistidos) y clustering anónimo de personas (`cluster-people`, tabla
+  `person_cluster_members`, etiquetas `P0001`, …); agrupa quién-aparece-
+  dónde sin identificar a nadie.
+- V2.5+: vista previa de organización (`plan.json`), pares/grupos de
+  coocurrencia.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.

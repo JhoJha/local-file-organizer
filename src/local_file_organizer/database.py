@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS face_observations (
     source_height INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_face_observations_path ON face_observations(file_path);
+CREATE TABLE IF NOT EXISTS person_cluster_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_label TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_category TEXT NOT NULL,
+    observation_count INTEGER NOT NULL,
+    UNIQUE(person_label, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_person_cluster_members_label ON person_cluster_members(person_label);
+CREATE INDEX IF NOT EXISTS idx_person_cluster_members_path ON person_cluster_members(file_path);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -413,3 +423,52 @@ def fetch_face_observation_counts(
             else 0
         )
     return {"total": total, "files_with_faces": files_with}
+
+
+def clear_all_person_cluster_members(conn: sqlite3.Connection) -> None:
+    """Delete ALL person_cluster_members rows (full rebuild semantics).
+
+    Unlike every other clear function in this codebase (all per-file),
+    clustering is a global/relative operation over the whole batch, not
+    something that can be updated incrementally per file — so each
+    `cluster-people` run clears the whole table and rebuilds it.
+    """
+    conn.execute("DELETE FROM person_cluster_members")
+
+
+def insert_person_cluster_members(conn: sqlite3.Connection, rows: list) -> None:
+    """Bulk-insert (person_label, file_path, file_category, observation_count) tuples."""
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT INTO person_cluster_members "
+        "(person_label, file_path, file_category, observation_count) "
+        "VALUES (?, ?, ?, ?)",
+        list(rows),
+    )
+
+
+def fetch_person_cluster_summary(conn: sqlite3.Connection) -> list[dict]:
+    """One row per distinct person_label with files/images/videos counts.
+
+    `images`/`videos` derive from `file_category`; ordered by person_label.
+    """
+    cur = conn.execute(
+        "SELECT person_label, "
+        "COUNT(DISTINCT file_path) AS files, "
+        "SUM(CASE WHEN file_category = 'image' THEN 1 ELSE 0 END) AS images, "
+        "SUM(CASE WHEN file_category = 'video' THEN 1 ELSE 0 END) AS videos "
+        "FROM person_cluster_members "
+        "GROUP BY person_label ORDER BY person_label"
+    )
+    result = []
+    for row in cur.fetchall():
+        result.append(
+            {
+                "person_label": row["person_label"],
+                "files": row["files"],
+                "images": row["images"] or 0,
+                "videos": row["videos"] or 0,
+            }
+        )
+    return result

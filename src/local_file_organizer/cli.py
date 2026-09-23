@@ -1,4 +1,4 @@
-"""Command-line interface: scan, summary, duplicates, similar-images, sample-frames, detect-faces.
+"""Command-line interface: scan, summary, duplicates, similar-images, sample-frames, detect-faces, cluster-people.
 
 Every code path in this module is read-only with respect to the scanned
 tree: it lists files, reads their metadata/bytes (including decoding
@@ -14,13 +14,22 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import cv2
+
 from . import database
 from .classifier import classify
+from .face_clustering import assign_person_labels, cluster_people
+from .face_clustering import (
+    ClusterableObservation,
+    DEFAULT_SIMILARITY_THRESHOLD as DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+)
 from .face_detection import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_MIN_FACE_SIZE_PX,
     detect_faces_in_image_file,
+    detect_faces_raw,
 )
+from .face_embedding import compute_embedding
 from .hashing import DuplicateRecord, find_duplicates
 from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
 from .video_sampling import compute_sample_timestamps, sample_video_frames
@@ -607,6 +616,248 @@ def run_detect_faces(
     conn.close()
 
 
+def run_cluster_people(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    similarity_threshold: float = DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
+    max_video_samples: int = 30,
+    redact_paths: bool = False,
+    quiet: bool = False,
+    verify_readonly: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+) -> None:
+    """Cluster face embeddings into anonymous person labels (P0001, ...).
+
+    Embeddings live only as transient in-memory arrays during this run and
+    are discarded when it ends; only the derived anonymous (person label,
+    file) membership rows are persisted (full rebuild of
+    `person_cluster_members` on every run).
+    """
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        print(
+            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
+            "punto de montaje o crea la carpeta esperada.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+
+    start = time.perf_counter()
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    walk_errors: list[ScanError] = []
+
+    def _on_error(err: ScanError) -> None:
+        walk_errors.append(err)
+        if not quiet and not redact_paths:
+            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
+
+    before_snapshot = None
+    if verify_readonly:
+        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(before_snapshot, snapshot_dir / "before.json")
+
+    conn = database.connect(db_path)
+    observations: list[ClusterableObservation] = []
+    file_of_obs: list[tuple[str, str]] = []  # (file_path, file_category) per observation
+    face_observations_considered = 0
+    processed_files = 0
+
+    for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
+        category = classify(file_path.suffix)
+        if category == "image":
+            processed_files += 1
+            try:
+                _w, _h, rows, error = detect_faces_raw(
+                    file_path, confidence_threshold=confidence_threshold
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad image never aborts the run
+                if not quiet and not redact_paths:
+                    print(f"Clustering {file_path}: error: {exc}")
+                continue
+            if error is not None or rows is None:
+                if error is not None and not quiet and not redact_paths:
+                    print(f"Clustering {file_path}: error: {error}")
+                if not quiet and redact_paths:
+                    if processed_files % 10 == 0 or processed_files == 1:
+                        print(f"Procesados {processed_files} archivos...")
+                continue
+            img = cv2.imread(str(file_path))
+            for row in rows:
+                face_observations_considered += 1
+                w = round(float(row[2]))
+                h = round(float(row[3]))
+                if w < min_face_size or h < min_face_size:
+                    continue
+                if img is None:
+                    continue
+                emb = compute_embedding(img, row)
+                if emb is None:
+                    continue
+                x = max(0, round(float(row[0])))
+                observations.append(
+                    ClusterableObservation(
+                        key=(str(file_path), "image", -1, x),
+                        embedding=emb,
+                    )
+                )
+                file_of_obs.append((str(file_path), "image"))
+            if not quiet:
+                if redact_paths:
+                    if processed_files % 10 == 0 or processed_files == 1:
+                        print(f"Procesados {processed_files} archivos...")
+                else:
+                    print(f"Clustering {file_path}: {len(rows)} caras detectadas")
+        elif category == "video":
+            processed_files += 1
+            try:
+                video_meta = get_video_metadata(file_path)
+                if video_meta.error or video_meta.duration_seconds is None:
+                    result_error = video_meta.error or "no duration available"
+                    if not quiet and not redact_paths:
+                        print(f"Clustering {file_path}: error: {result_error}")
+                    continue
+                timestamps = compute_sample_timestamps(
+                    video_meta.duration_seconds, max_video_samples
+                )
+                face_counts = {"considered": 0}
+
+                def _on_frame(
+                    frame_path: Path, timestamp: float, _idx: int
+                ) -> None:
+                    _fw2, _fh2, frows2, ferror2 = detect_faces_raw(
+                        frame_path, confidence_threshold=confidence_threshold
+                    )
+                    if ferror2 is not None or frows2 is None:
+                        return
+                    frame_img2 = cv2.imread(str(frame_path))
+                    if frame_img2 is None:
+                        return
+                    timestamp_ms2 = timestamp * 1000
+                    for frow2 in frows2:
+                        face_counts["considered"] += 1
+                        w2 = round(float(frow2[2]))
+                        h2 = round(float(frow2[3]))
+                        if w2 < min_face_size or h2 < min_face_size:
+                            continue
+                        emb2 = compute_embedding(frame_img2, frow2)
+                        if emb2 is None:
+                            continue
+                        x2 = max(0, round(float(frow2[0])))
+                        observations.append(
+                            ClusterableObservation(
+                                key=(str(file_path), "video_frame", timestamp_ms2, x2),
+                                embedding=emb2,
+                            )
+                        )
+                        file_of_obs.append((str(file_path), "video"))
+
+                sampling = sample_video_frames(
+                    file_path,
+                    timestamps,
+                    on_frame=_on_frame,
+                    keep_debug_frames=False,
+                )
+                face_observations_considered += face_counts["considered"]
+                if sampling.video_error is not None:
+                    if not quiet and not redact_paths:
+                        print(f"Clustering {file_path}: error: {sampling.video_error}")
+                    continue
+            except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
+                if not quiet and not redact_paths:
+                    print(f"Clustering {file_path}: error: {exc}")
+                continue
+
+            if not quiet:
+                if redact_paths:
+                    if processed_files % 10 == 0 or processed_files == 1:
+                        print(f"Procesados {processed_files} archivos...")
+                # else: per-video line omitted to avoid noisy frame counts;
+                # the sanitized summary below is the contract.
+
+    usable_embeddings = len(observations)
+    rejected_faces = face_observations_considered - usable_embeddings
+
+    distance_threshold = 1.0 - similarity_threshold
+    clusters = cluster_people(observations, threshold=distance_threshold)
+    labels = assign_person_labels(clusters)
+
+    # For each (file_path, file_category) group, count observations per person.
+    counts_by_pair: dict[tuple[str, str, str], int] = {}
+    for obs_index, label in labels.items():
+        fpath, fcat = file_of_obs[obs_index]
+        key = (label, fpath, fcat)
+        counts_by_pair[key] = counts_by_pair.get(key, 0) + 1
+    rows_to_insert = [
+        (label, fpath, fcat, count) for (label, fpath, fcat), count in counts_by_pair.items()
+    ]
+
+    database.clear_all_person_cluster_members(conn)
+    database.insert_person_cluster_members(conn, rows_to_insert)
+    conn.commit()
+
+    summary = database.fetch_person_cluster_summary(conn)
+    person_clusters = len(summary)
+    # Distinct files where exactly 2 distinct person labels are present.
+    per_file_labels: dict[str, set[str]] = {}
+    for label, fpath, _fcat, _count in rows_to_insert:
+        per_file_labels.setdefault(fpath, set()).add(label)
+    cooccurrence_files = sum(1 for labels_set in per_file_labels.values() if len(labels_set) == 2)
+
+    if verify_readonly:
+        after_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(after_snapshot, snapshot_dir / "after.json")
+        readonly_diff = diff_snapshots(before_snapshot, after_snapshot)
+        print()
+        print("=== VERIFICACIÓN READ-ONLY ===")
+        print(
+            f"added={len(readonly_diff.added)} removed={len(readonly_diff.removed)} "
+            f"size_changed={len(readonly_diff.size_changed)} "
+            f"mtime_changed={len(readonly_diff.mtime_changed)}"
+        )
+        if readonly_diff.is_clean:
+            print("OK: ningún archivo original cambió durante el escaneo.")
+        else:
+            print(
+                "ALERTA: se detectaron cambios en los archivos originales durante el escaneo.",
+                file=sys.stderr,
+            )
+            for label_name, paths in (
+                ("added", readonly_diff.added),
+                ("removed", readonly_diff.removed),
+                ("size_changed", readonly_diff.size_changed),
+                ("mtime_changed", readonly_diff.mtime_changed),
+            ):
+                for changed_path in paths[:20]:
+                    print(f"  [{label_name}] {changed_path}", file=sys.stderr)
+
+    elapsed_seconds = time.perf_counter() - start
+
+    print()
+    print("=== PERSON CLUSTERING ===")
+    print(f"face_observations_considered={face_observations_considered}")
+    print(f"usable_embeddings={usable_embeddings}")
+    print(f"rejected_faces={rejected_faces}")
+    print(f"person_clusters={person_clusters}")
+    print()
+    for entry in summary:
+        print(
+            f"{entry['person_label']} files={entry['files']} "
+            f"images={entry['images']} videos={entry['videos']}"
+        )
+    print()
+    print(f"cooccurrence_files={cooccurrence_files}")
+    print(f"elapsed_seconds={elapsed_seconds:.2f}")
+    if walk_errors:
+        print(f"Directorios no listados por error de permisos: {len(walk_errors)}")
+
+    conn.close()
+
+
 def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     if not db_path.exists():
         print(
@@ -779,6 +1030,35 @@ def build_parser() -> argparse.ArgumentParser:
     faces_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
     faces_parser.add_argument("--quiet", action="store_true")
 
+    cluster_parser = subparsers.add_parser(
+        "cluster-people",
+        help="Agrupar caras en personas anónimas (P0001, ...) con embeddings locales.",
+    )
+    cluster_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    cluster_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    cluster_parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+        help=(
+            "Similitud coseno mínima (0-1) para considerar dos caras la misma "
+            "persona (por defecto "
+            f"{DEFAULT_PERSON_SIMILARITY_THRESHOLD}): mayor = más estricto / "
+            "menos fusiones. OJO: dirección opuesta a la de `scan "
+            "--similarity-threshold`, que es una distancia Hamming donde "
+            "menor = más estricto."
+        ),
+    )
+    cluster_parser.add_argument(
+        "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
+    )
+    cluster_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    cluster_parser.add_argument("--max-video-samples", type=int, default=30)
+    cluster_parser.add_argument("--redact-paths", action="store_true")
+    cluster_parser.add_argument("--verify-readonly", action="store_true")
+    cluster_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    cluster_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -819,6 +1099,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         run_detect_faces(
             target=args.target,
             db_path=args.db,
+            confidence_threshold=args.confidence_threshold,
+            min_face_size=args.min_face_size,
+            max_video_samples=args.max_video_samples,
+            redact_paths=args.redact_paths,
+            quiet=args.quiet,
+            verify_readonly=args.verify_readonly,
+            snapshot_dir=args.snapshot_dir,
+        )
+    elif args.command == "cluster-people":
+        run_cluster_people(
+            target=args.target,
+            db_path=args.db,
+            similarity_threshold=args.similarity_threshold,
             confidence_threshold=args.confidence_threshold,
             min_face_size=args.min_face_size,
             max_video_samples=args.max_video_samples,

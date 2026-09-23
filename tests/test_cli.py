@@ -740,5 +740,311 @@ class DetectFacesCliTests(unittest.TestCase):
             self.assertIn(secret, err2.getvalue())
 
 
+class ClusterPeopleCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.target = Path(self.tmpdir.name) / "target"
+        self.target.mkdir()
+        self.output_dir = Path(self.tmpdir.name) / "output"
+        self.output_dir.mkdir()
+        self.db_path = self.output_dir / "catalog.sqlite"
+        self.frames_dir = Path(self.tmpdir.name) / "frames"
+        self.frames_dir.mkdir()
+
+    def _emb(self, index: int):
+        import numpy as np
+
+        v = np.zeros(128, dtype=np.float32)
+        v[index] = 1.0
+        return v
+
+    def _row(self, x, y=5, w=30, h=30, confidence=0.9):
+        full = [0.0] * 15
+        full[0], full[1], full[2], full[3] = x, y, w, h
+        # Plausible landmark points inside the box (content is irrelevant:
+        # compute_embedding is mocked in these tests).
+        full[4], full[5] = x + 8, y + 10
+        full[6], full[7] = x + 22, y + 10
+        full[8], full[9] = x + 15, y + 18
+        full[10], full[11] = x + 10, y + 24
+        full[12], full[13] = x + 20, y + 24
+        full[14] = confidence
+        return full
+
+    def _rows_array(self, rows):
+        import numpy as np
+
+        return np.array(rows, dtype=np.float32)
+
+    def _embedding_by_x(self, emb_a, emb_b):
+        def _fake_compute(img, row):
+            if round(float(row[0])) == 10:
+                return emb_a
+            return emb_b
+
+        return _fake_compute
+
+    def _run(self, **kwargs):
+        from local_file_organizer.cli import run_cluster_people
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_cluster_people(self.target, db_path=self.db_path, quiet=True, **kwargs)
+        return output.getvalue()
+
+    def _db_rows(self):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT person_label, file_path, file_category, observation_count "
+            "FROM person_cluster_members ORDER BY person_label, file_path"
+        ).fetchall()
+        conn.close()
+        return [tuple(r) for r in rows]
+
+    def test_two_persons_and_cooccurrence(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+
+        emb_a, emb_b = self._emb(0), self._emb(1)
+        _save_gradient(self.target / "a.png")
+        _save_gradient(self.target / "b.png")
+        _save_gradient(self.target / "c.png")
+
+        rows_by_name = {
+            "a.png": self._rows_array([self._row(10)]),
+            "b.png": self._rows_array([self._row(50)]),
+            "c.png": self._rows_array([self._row(10), self._row(50)]),
+        }
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, rows_by_name[Path(path).name], None)
+
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(
+                cli_module, "compute_embedding", side_effect=self._embedding_by_x(emb_a, emb_b)
+            ),
+        ):
+            printed = self._run()
+
+        self.assertIn("=== PERSON CLUSTERING ===", printed)
+        self.assertIn("face_observations_considered=4", printed)
+        self.assertIn("usable_embeddings=4", printed)
+        self.assertIn("rejected_faces=0", printed)
+        self.assertIn("person_clusters=2", printed)
+        # Deterministic key order: a.png's embedding sorts first -> P0001.
+        self.assertIn("P0001 files=2 images=2 videos=0", printed)
+        self.assertIn("P0002 files=2 images=2 videos=0", printed)
+        # c.png holds two distinct persons -> PAIR_-like co-occurrence.
+        self.assertIn("cooccurrence_files=1", printed)
+
+        rows = self._db_rows()
+        self.assertEqual(len(rows), 4)
+        by_pair = {(r[0], Path(r[1]).name): (r[2], r[3]) for r in rows}
+        self.assertEqual(by_pair[("P0001", "a.png")], ("image", 1))
+        self.assertEqual(by_pair[("P0002", "b.png")], ("image", 1))
+        self.assertEqual(by_pair[("P0001", "c.png")], ("image", 1))
+        self.assertEqual(by_pair[("P0002", "c.png")], ("image", 1))
+
+        # Re-running fully replaces rather than accumulating.
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(
+                cli_module, "compute_embedding", side_effect=self._embedding_by_x(emb_a, emb_b)
+            ),
+        ):
+            self._run()
+        self.assertEqual(self._db_rows(), rows)
+
+    def test_video_frames_of_same_person_collapse_to_one_row(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer.video_sampling import SamplingResult
+
+        emb_a = self._emb(0)
+        clip = self.target / "clip.mp4"
+        clip.write_bytes(b"fake-video-bytes")
+
+        def _fake_detect(path, **kwargs):
+            return (160, 120, self._rows_array([self._row(10)]), None)
+
+        def _fake_sample(path, timestamps, on_frame=None, **kwargs):
+            for idx, ts in enumerate(timestamps):
+                frame = self.frames_dir / f"frame_{idx:04d}.png"
+                _save_gradient(frame)
+                if on_frame is not None:
+                    on_frame(frame, ts, idx)
+            return SamplingResult(
+                timestamps_requested=len(timestamps),
+                frames_generated=len(timestamps),
+                frames_failed=0,
+                samples=[],
+                video_error=None,
+            )
+
+        with (
+            mock.patch.object(
+                cli_module,
+                "get_video_metadata",
+                return_value=SimpleNamespace(error=None, duration_seconds=2.0),
+            ),
+            mock.patch.object(cli_module, "sample_video_frames", side_effect=_fake_sample),
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", return_value=emb_a),
+        ):
+            printed = self._run()
+
+        # duration=2.0s -> 8 sample timestamps; every frame yields the same
+        # fake embedding, so the whole video is ONE person, not 8 people.
+        from local_file_organizer.video_sampling import compute_sample_timestamps
+
+        n_frames = len(compute_sample_timestamps(2.0, 30))
+        self.assertIn(f"face_observations_considered={n_frames}", printed)
+        self.assertIn(f"usable_embeddings={n_frames}", printed)
+        self.assertIn("rejected_faces=0", printed)
+        self.assertIn("person_clusters=1", printed)
+        self.assertIn("P0001 files=1 images=0 videos=1", printed)
+        self.assertIn("cooccurrence_files=0", printed)
+
+        rows = self._db_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "P0001")
+        self.assertEqual(rows[0][1], str(clip))
+        self.assertEqual(rows[0][2], "video")
+        self.assertEqual(rows[0][3], n_frames)
+
+    def test_rejected_counts_cover_filter_and_embedding_failure(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+
+        emb_a = self._emb(0)
+        _save_gradient(self.target / "ok.png")
+        _save_gradient(self.target / "tiny.png")
+        _save_gradient(self.target / "bad-emb.png")
+
+        rows_by_name = {
+            "ok.png": self._rows_array([self._row(10)]),
+            "tiny.png": self._rows_array([self._row(10, w=5, h=5)]),
+            "bad-emb.png": self._rows_array([self._row(50)]),
+        }
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, rows_by_name[Path(path).name], None)
+
+        def _fake_compute(img, row):
+            if round(float(row[0])) == 10:
+                return emb_a
+            return None
+
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", side_effect=_fake_compute),
+        ):
+            printed = self._run()
+
+        # 3 raw rows examined; 1 survives (1 too small, 1 embedding None).
+        self.assertIn("face_observations_considered=3", printed)
+        self.assertIn("usable_embeddings=1", printed)
+        self.assertIn("rejected_faces=2", printed)
+        self.assertIn("person_clusters=1", printed)
+
+    def test_redact_paths_hides_paths_but_not_person_labels(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer.cli import run_cluster_people
+        from local_file_organizer.scanner import ScanError
+        from local_file_organizer.scanner import iter_files as real_iter_files
+
+        emb_a = self._emb(0)
+        _save_gradient(self.target / "photo.png")
+        secret = str(self.target / "secret-dir")
+
+        def _fake_iter_files(root, ignored_dirs=frozenset(), on_error=None):
+            if on_error is not None:
+                on_error(ScanError(path=secret, message="permission denied"))
+            yield from real_iter_files(root, ignored_dirs=ignored_dirs, on_error=on_error)
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, self._rows_array([self._row(10)]), None)
+
+        with (
+            mock.patch("local_file_organizer.cli.iter_files", side_effect=_fake_iter_files),
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", return_value=emb_a),
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                run_cluster_people(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=True,
+                    quiet=False,
+                )
+            redacted = out.getvalue() + err.getvalue()
+            self.assertIn("=== PERSON CLUSTERING ===", out.getvalue())
+            self.assertNotIn(secret, redacted)
+            self.assertNotIn(str(self.target / "photo.png"), redacted)
+            # Person labels are NOT paths: unaffected by --redact-paths.
+            self.assertIn("P0001", out.getvalue())
+
+            # Sanity check: without --redact-paths the same walk error IS
+            # reported with its path, proving the redacted run above
+            # actually exercised the error path.
+            out2, err2 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out2), redirect_stderr(err2):
+                run_cluster_people(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=False,
+                    quiet=False,
+                )
+            self.assertIn(secret, err2.getvalue())
+
+    def test_verify_readonly_reports_clean_diff(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer.snapshot import diff_snapshots, load_snapshot
+
+        emb_a = self._emb(0)
+        _save_gradient(self.target / "photo.png")
+        snapshot_dir = self.output_dir / "snapshots"
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, self._rows_array([self._row(10)]), None)
+
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", return_value=emb_a),
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                from local_file_organizer.cli import run_cluster_people
+
+                run_cluster_people(
+                    self.target,
+                    db_path=self.db_path,
+                    quiet=True,
+                    verify_readonly=True,
+                    snapshot_dir=snapshot_dir,
+                )
+        printed = output.getvalue()
+        self.assertIn("=== PERSON CLUSTERING ===", printed)
+        self.assertIn("=== VERIFICACIÓN READ-ONLY ===", printed)
+
+        self.assertTrue((snapshot_dir / "before.json").exists())
+        self.assertTrue((snapshot_dir / "after.json").exists())
+        before = load_snapshot(snapshot_dir / "before.json")
+        after = load_snapshot(snapshot_dir / "after.json")
+        self.assertTrue(diff_snapshots(before, after).is_clean)
+
+
 if __name__ == "__main__":
     unittest.main()
