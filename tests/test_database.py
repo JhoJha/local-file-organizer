@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from local_file_organizer.database import FileRecord, connect, init_db, upsert_file
+from local_file_organizer.face_detection import FaceObservation
 
 
 class UpsertTests(unittest.TestCase):
@@ -148,6 +149,85 @@ class UpsertTests(unittest.TestCase):
         init_db(conn)  # calling again must not raise or duplicate columns
         columns = [row["name"] for row in conn.execute("PRAGMA table_info(files)")]
         self.assertEqual(len(columns), len(set(columns)))
+        conn.close()
+
+
+class FaceObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.db_path = Path(self.tmpdir.name) / "catalog.sqlite"
+
+    def _obs(self, x=10, y=20, w=30, h=40, conf=0.9):
+        return FaceObservation(
+            bbox_x=x,
+            bbox_y=y,
+            bbox_width=w,
+            bbox_height=h,
+            detection_confidence=conf,
+            source_width=100,
+            source_height=80,
+        )
+
+    def test_insert_clear_fetch_round_trip(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_face_observations(
+            conn, "/img/photo.png", "image", [self._obs()], timestamp_ms=None
+        )
+        database.insert_face_observations(
+            conn,
+            "/v/clip.mp4",
+            "video_frame",
+            [self._obs(), self._obs(x=1)],
+            timestamp_ms=500.0,
+        )
+        conn.commit()
+
+        counts = database.fetch_face_observation_counts(conn)
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["files_with_faces"], 2)
+
+        rows = conn.execute(
+            "SELECT * FROM face_observations WHERE file_path = ?",
+            ("/v/clip.mp4",),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["source_type"] == "video_frame" for r in rows))
+        self.assertTrue(all(r["timestamp_ms"] == 500.0 for r in rows))
+        img_rows = conn.execute(
+            "SELECT * FROM face_observations WHERE file_path = ?",
+            ("/img/photo.png",),
+        ).fetchall()
+        self.assertEqual(len(img_rows), 1)
+        self.assertIsNone(img_rows[0]["timestamp_ms"])
+
+        # Clearing one file leaves the other's rows behind.
+        database.clear_face_observations(conn, "/img/photo.png")
+        conn.commit()
+        counts = database.fetch_face_observation_counts(conn)
+        self.assertEqual(counts["total"], 2)
+        self.assertEqual(counts["files_with_faces"], 1)
+
+        # Re-inserting after clear replaces rather than accumulates.
+        database.clear_face_observations(conn, "/v/clip.mp4")
+        database.insert_face_observations(
+            conn, "/v/clip.mp4", "video_frame", [self._obs()], timestamp_ms=1000.0
+        )
+        conn.commit()
+        counts = database.fetch_face_observation_counts(conn, "/v/clip.mp4")
+        self.assertEqual(counts["total"], 1)
+        conn.close()
+
+    def test_insert_empty_is_noop(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.insert_face_observations(conn, "/img/empty.png", "image", [])
+        conn.commit()
+        counts = database.fetch_face_observation_counts(conn)
+        self.assertEqual(counts, {"total": 0, "files_with_faces": 0})
         conn.close()
 
 

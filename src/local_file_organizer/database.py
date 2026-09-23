@@ -47,6 +47,20 @@ CREATE TABLE IF NOT EXISTS video_frame_samples (
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_video_frame_samples_path ON video_frame_samples(file_path);
+CREATE TABLE IF NOT EXISTS face_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    timestamp_ms REAL,
+    bbox_x INTEGER NOT NULL,
+    bbox_y INTEGER NOT NULL,
+    bbox_width INTEGER NOT NULL,
+    bbox_height INTEGER NOT NULL,
+    detection_confidence REAL NOT NULL,
+    source_width INTEGER NOT NULL,
+    source_height INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_face_observations_path ON face_observations(file_path);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -334,3 +348,68 @@ def fetch_video_frame_sample_counts(
         if row["status"] in counts:
             counts[row["status"]] = row["n"]
     return counts
+
+
+def clear_face_observations(conn: sqlite3.Connection, file_path: str) -> None:
+    conn.execute("DELETE FROM face_observations WHERE file_path = ?", (file_path,))
+
+
+def insert_face_observations(
+    conn: sqlite3.Connection,
+    file_path: str,
+    source_type: str,
+    observations: list,
+    *,
+    timestamp_ms: Optional[float] = None,
+) -> None:
+    """Bulk-insert face observations from one image or one video frame."""
+    if not observations:
+        return
+    conn.executemany(
+        "INSERT INTO face_observations "
+        "(file_path, source_type, timestamp_ms, bbox_x, bbox_y, "
+        "bbox_width, bbox_height, detection_confidence, "
+        "source_width, source_height) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                file_path,
+                source_type,
+                timestamp_ms,
+                o.bbox_x,
+                o.bbox_y,
+                o.bbox_width,
+                o.bbox_height,
+                o.detection_confidence,
+                o.source_width,
+                o.source_height,
+            )
+            for o in observations
+        ],
+    )
+
+
+def fetch_face_observation_counts(
+    conn: sqlite3.Connection, file_path: Optional[str] = None
+) -> dict:
+    """Return aggregate face-detection counts, globally or for one file."""
+    if file_path is None:
+        total = conn.execute("SELECT COUNT(*) FROM face_observations").fetchone()[0]
+        files_with = conn.execute(
+            "SELECT COUNT(DISTINCT file_path) FROM face_observations"
+        ).fetchone()[0]
+    else:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM face_observations WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()[0]
+        files_with = (
+            1
+            if conn.execute(
+                "SELECT COUNT(*) FROM face_observations WHERE file_path = ?",
+                (file_path,),
+            ).fetchone()[0]
+            > 0
+            else 0
+        )
+    return {"total": total, "files_with_faces": files_with}

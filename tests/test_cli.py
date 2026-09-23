@@ -535,5 +535,210 @@ class SampleFramesCliTests(unittest.TestCase):
             self.assertIn(secret, err2.getvalue())
 
 
+class DetectFacesCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.target = Path(self.tmpdir.name) / "target"
+        self.target.mkdir()
+        self.output_dir = Path(self.tmpdir.name) / "output"
+        self.output_dir.mkdir()
+        self.db_path = self.output_dir / "catalog.sqlite"
+
+    def _make_video(self, name: str, duration: float = 2.0) -> Path:
+        out = self.target / name
+        subprocess.run(
+            [
+                "ffmpeg", "-f", "lavfi", "-i",
+                f"testsrc=duration={duration}:size=160x120:rate=10",
+                "-y", str(out),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        return out
+
+    def test_detect_faces_images_zero_vs_mocked(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer.cli import run_detect_faces
+        from local_file_organizer.face_detection import (
+            FaceDetectionResult,
+            FaceObservation,
+        )
+
+        _save_gradient(self.target / "zero.png")
+        _save_gradient(self.target / "face.png")
+
+        real_detect = cli_module.detect_faces_in_image_file
+
+        def _fake_detect(path, **kwargs):
+            if Path(path).name == "face.png":
+                return FaceDetectionResult(
+                    width=64,
+                    height=64,
+                    faces=[
+                        FaceObservation(
+                            bbox_x=5,
+                            bbox_y=5,
+                            bbox_width=30,
+                            bbox_height=30,
+                            detection_confidence=0.9,
+                            source_width=64,
+                            source_height=64,
+                        )
+                    ],
+                )
+            return real_detect(path, **kwargs)
+
+        with mock.patch.object(cli_module, "detect_faces_in_image_file", side_effect=_fake_detect):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                run_detect_faces(self.target, db_path=self.db_path, quiet=True)
+        printed = output.getvalue()
+        self.assertIn("=== FACE DETECTION ===", printed)
+        self.assertIn("images_processed=2", printed)
+        self.assertIn("face_observations=1", printed)
+        self.assertIn("files_with_faces=1", printed)
+        self.assertIn("files_without_faces=1", printed)
+        self.assertIn("detector_errors=0", printed)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM face_observations").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source_type"], "image")
+        self.assertIsNone(rows[0]["timestamp_ms"])
+        count_before = len(rows)
+        conn.close()
+
+        # Re-running replaces rows rather than accumulating.
+        with mock.patch.object(cli_module, "detect_faces_in_image_file", side_effect=_fake_detect):
+            with redirect_stdout(io.StringIO()):
+                run_detect_faces(self.target, db_path=self.db_path, quiet=True)
+        conn = sqlite3.connect(str(self.db_path))
+        count_after = conn.execute("SELECT COUNT(*) FROM face_observations").fetchone()[0]
+        conn.close()
+        self.assertEqual(count_before, count_after)
+
+    @unittest.skipUnless(
+        ffprobe_available() and shutil.which("ffmpeg") is not None,
+        "ffmpeg/ffprobe not installed",
+    )
+    def test_detect_faces_video_mocked_persists_frames_and_samples(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer.cli import run_detect_faces
+        from local_file_organizer.face_detection import (
+            FaceDetectionResult,
+            FaceObservation,
+        )
+
+        self._make_video("clip.mp4")
+        _save_gradient(self.target / "still.png")
+
+        def _fake_detect(path, **kwargs):
+            return FaceDetectionResult(
+                width=160,
+                height=120,
+                faces=[
+                    FaceObservation(
+                        bbox_x=1,
+                        bbox_y=1,
+                        bbox_width=40,
+                        bbox_height=40,
+                        detection_confidence=0.8,
+                        source_width=160,
+                        source_height=120,
+                    )
+                ],
+            )
+
+        with mock.patch.object(cli_module, "detect_faces_in_image_file", side_effect=_fake_detect):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                snapshot_dir = self.output_dir / "snapshots"
+                run_detect_faces(
+                    self.target,
+                    db_path=self.db_path,
+                    quiet=True,
+                    verify_readonly=True,
+                    snapshot_dir=snapshot_dir,
+                )
+        printed = output.getvalue()
+        self.assertIn("=== FACE DETECTION ===", printed)
+        self.assertIn("=== VERIFICACIÓN READ-ONLY ===", printed)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        video_rows = conn.execute(
+            "SELECT * FROM face_observations WHERE file_path = ?",
+            (str(self.target / "clip.mp4"),),
+        ).fetchall()
+        self.assertTrue(video_rows)
+        self.assertTrue(all(r["source_type"] == "video_frame" for r in video_rows))
+        self.assertTrue(all(r["timestamp_ms"] is not None for r in video_rows))
+        # detect-faces also leaves the sampling diagnostics behind.
+        sample_rows = conn.execute(
+            "SELECT * FROM video_frame_samples WHERE file_path = ?",
+            (str(self.target / "clip.mp4"),),
+        ).fetchall()
+        self.assertTrue(sample_rows)
+        conn.close()
+
+        before = load_snapshot(snapshot_dir / "before.json")
+        after = load_snapshot(snapshot_dir / "after.json")
+        self.assertTrue(diff_snapshots(before, after).is_clean)
+
+    @unittest.skipUnless(
+        ffprobe_available() and shutil.which("ffmpeg") is not None,
+        "ffmpeg/ffprobe not installed",
+    )
+    def test_detect_faces_redact_paths_hides_walk_errors(self):
+        from unittest import mock
+
+        from local_file_organizer.cli import run_detect_faces
+        from local_file_organizer.scanner import ScanError
+        from local_file_organizer.scanner import iter_files as real_iter_files
+
+        _save_gradient(self.target / "photo.png")
+        secret = str(self.target / "secret-dir")
+
+        def _fake_iter_files(root, ignored_dirs=frozenset(), on_error=None):
+            if on_error is not None:
+                on_error(ScanError(path=secret, message="permission denied"))
+            yield from real_iter_files(
+                root, ignored_dirs=ignored_dirs, on_error=on_error
+            )
+
+        with mock.patch(
+            "local_file_organizer.cli.iter_files", side_effect=_fake_iter_files
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                run_detect_faces(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=True,
+                    quiet=False,
+                )
+            redacted = out.getvalue() + err.getvalue()
+            self.assertIn("=== FACE DETECTION ===", out.getvalue())
+            self.assertNotIn(secret, redacted)
+
+            out2, err2 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out2), redirect_stderr(err2):
+                run_detect_faces(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=False,
+                    quiet=False,
+                )
+            self.assertIn(secret, err2.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

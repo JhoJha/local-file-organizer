@@ -13,6 +13,16 @@ dependencies = [
     # library that fills that one gap (grayscale + resize) without pulling
     # in a heavier CV/ML stack.
     "pillow>=9.1,<13",
+    # Needed for V2.3 local face detection (YuNet, via OpenCV's
+    # FaceDetectorYN); -headless variant because this is a CLI tool with
+    # no GUI/display need (smaller install, no X11/Qt bindings).
+    "opencv-python-headless>=4.8,<5.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff==0.9.10",
 ]
 
 [tool.setuptools.packages.find]

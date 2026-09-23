@@ -1,4 +1,4 @@
-# local-file-organizer (V2.2 — inventario read-only + similitud visual + muestreo de frames)
+# local-file-organizer (V2.3 — inventario read-only + similitud visual + muestreo de frames + detección facial)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -28,21 +28,31 @@ servicios en la nube ni usa IA generativa.
     `ffmpeg` y guarda solo los resultados (índice, timestamp, estado) en
     `video_frame_samples` — ver
     [Muestreo de frames de video (V2.2)](#muestreo-de-frames-de-video-v22).
+11. (V2.3) `detect-faces` detecta regiones con forma de cara en imágenes y
+    en frames muestreados de video, y guarda solo números (bbox +
+    confianza) en `face_observations` — ver
+    [Detección facial local (V2.3)](#detección-facial-local-v23).
 
 ## Qué NO hace (por diseño)
 
 No mueve, copia, renombra ni borra archivos; no modifica metadatos ni
 timestamps originales; no usa IA generativa ni APIs externas; no sube nada
-a la nube; no hace reconocimiento facial (los frames de video solo se
-extraen de forma efímera para alimentar análisis locales futuros); no
-reorganiza carpetas.
+a la nube; no hace reconocimiento facial: V2.3 *detecta* regiones con
+forma de cara (que *hay* una cara en tal bbox con tal confianza) pero
+sigue sin *reconocer* ni identificar quién es nadie — no hay nombres,
+embeddings ni IDs de persona (eso queda para V2.4); no reorganiza
+carpetas.
 
 ## Requisitos
 
 - Python 3.9+.
-- [Pillow](https://python-pillow.org/) (`pillow>=9.1,<13`) — única
-  dependencia externa, usada solo para decodificar imágenes y calcular su
-  hash perceptual (ver más abajo por qué es necesaria).
+- [Pillow](https://python-pillow.org/) (`pillow>=9.1,<13`) — usada solo
+  para decodificar imágenes y calcular su hash perceptual (ver más abajo
+  por qué es necesaria).
+- [opencv-python-headless](https://opencv.org/) (`opencv-python-headless>=4.8,<5.1`) —
+  necesario solo para la detección facial local (V2.3: YuNet vía
+  `cv2.FaceDetectorYN`); variante `-headless` porque es una herramienta
+  CLI sin GUI (instalación más pequeña, sin bindings X11/Qt).
 - `ffmpeg`/`ffprobe` instalado en el sistema para metadata de video (si no
   está disponible, el escaneo continúa y solo se omite esa metadata,
   registrando el motivo por archivo).
@@ -63,6 +73,7 @@ python -m local_file_organizer summary
 python -m local_file_organizer duplicates
 python -m local_file_organizer similar-images
 python -m local_file_organizer sample-frames /ruta/a/analizar
+python -m local_file_organizer detect-faces /ruta/a/analizar
 ```
 
 Opciones de `scan`:
@@ -92,6 +103,23 @@ Opciones de `sample-frames`:
 - `--debug-dir RUTA` — dónde guardar los frames de depuración (por defecto
   `data/debug_frames/`).
 - `--redact-paths` — no imprime rutas por video, solo progreso agregado.
+- `--verify-readonly` — igual que en `scan`: snapshot antes/después y
+  bloque `=== VERIFICACIÓN READ-ONLY ===`.
+- `--snapshot-dir RUTA` — dónde guardar `before.json`/`after.json` (por
+  defecto `data/snapshots/`).
+- `--quiet` — reduce mensajes de progreso.
+
+Opciones de `detect-faces`:
+
+- `--db RUTA` — ruta del catálogo SQLite (por defecto `data/catalog.sqlite`).
+- `--confidence-threshold F` — confianza mínima del detector (por defecto
+  `0.6`).
+- `--min-face-size N` — lado mínimo en píxeles del bbox para conservar una
+  detección (por defecto `20`).
+- `--max-video-samples N` — tope de frames por video, pasado a la
+  estrategia de muestreo de V2.2 (por defecto `30`).
+- `--redact-paths` — no imprime rutas por archivo, solo el bloque agregado
+  final.
 - `--verify-readonly` — igual que en `scan`: snapshot antes/después y
   bloque `=== VERIFICACIÓN READ-ONLY ===`.
 - `--snapshot-dir RUTA` — dónde guardar `before.json`/`after.json` (por
@@ -250,14 +278,62 @@ la tabla `video_frame_samples` del catálogo; re-ejecutar reemplaza las
 filas de ese video en vez de acumularlas. Un video corrupto no aborta el
 resto: sus muestras quedan en `error` y el programa sigue con el siguiente.
 
-Todavía **no** hay detección facial, embeddings ni clustering de personas:
+Todavía **no** hay embeddings ni clustering de personas:
 V2.2 solo demuestra que el pipeline de muestreo funciona y que los frames
-se limpian correctamente. Eso queda explícitamente para iteraciones
-futuras.
+se limpian correctamente. La detección facial vive en V2.3 (ver abajo);
+los embeddings y el clustering quedan explícitamente para V2.4+.
 
 ```bash
 python -m local_file_organizer sample-frames /ruta/a/analizar
 ```
+
+## Detección facial local (V2.3)
+
+Para cada archivo de categoría `image`, y para cada frame muestreado
+(efímeramente, con la misma estrategia de V2.2) de cada archivo de
+categoría `video`, `detect-faces` detecta regiones con forma de cara —
+sin enviar ninguna imagen, frame, hash ni ruta a ningún servicio externo.
+
+### Backend: YuNet vía OpenCV, 100% local
+
+El detector es `cv2.FaceDetectorYN` (OpenCV) con el modelo YuNet
+`face_detection_yunet_2023mar.onnx`, vendoreado en `models/` (232589
+bytes, SHA-256
+`8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`,
+origen: `https://github.com/opencv/opencv_zoo`,
+`models/face_detection_yunet/face_detection_yunet_2023mar.onnx`). El
+modelo viaja dentro del repo: en tiempo de detección no hay ninguna
+llamada de red.
+
+### Qué se guarda (y qué no)
+
+Nunca se persiste ningún recorte de cara ni ningún byte de imagen/frame:
+cada detección guarda solo números en la tabla `face_observations`
+(bbox `x/y/width/height`, `detection_confidence`, dimensiones de la
+imagen/frame origen, más `source_type` — `'image'` o `'video_frame'` — y
+`timestamp_ms` para frames de video). Re-ejecutar reemplaza las filas de
+cada archivo en vez de acumularlas, y `detect-faces` deja además las
+mismas filas de diagnóstico en `video_frame_samples` que `sample-frames`.
+
+### Filtros de calidad
+
+Dos filtros independientes: `--confidence-threshold` (confianza mínima
+del detector, por defecto `0.6`) y `--min-face-size` (lado mínimo en
+píxeles del bbox, por defecto `20`; una cara exactamente en el umbral se
+conserva).
+
+```bash
+python -m local_file_organizer detect-faces /ruta/a/analizar
+```
+
+El resumen final (`=== FACE DETECTION ===`) solo muestra agregados, nunca
+rutas: imágenes procesadas, frames de video procesados, observaciones
+totales, archivos con/sin caras, errores del detector y segundos
+transcurridos.
+
+Este hito **no** identifica ni nombra a nadie: solo detecta que *existe*
+una región con forma de cara. Los embeddings y el clustering de personas
+(quién es quién) quedan explícitamente para V2.4.
 
 ## Modelo de errores por archivo
 
@@ -310,7 +386,9 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   similitud visual.
 - V2.2 (implementado): muestreo efímero de frames de video (`sample-frames`,
   tabla `video_frame_samples`); sin detección facial todavía.
-- V2.3+: detección facial, embeddings, clustering de personas.
+- V2.3 (implementado): detección facial local (`detect-faces`, tabla
+  `face_observations`); detecta regiones, no identifica personas.
+- V2.4+: embeddings faciales, clustering de personas.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.

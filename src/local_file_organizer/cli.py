@@ -1,9 +1,10 @@
-"""Command-line interface: scan, summary, duplicates, similar-images, sample-frames.
+"""Command-line interface: scan, summary, duplicates, similar-images, sample-frames, detect-faces.
 
 Every code path in this module is read-only with respect to the scanned
 tree: it lists files, reads their metadata/bytes (including decoding
-images in memory to compute a perceptual hash), and writes results only
-under this project's own data/ and reports/ directories.
+images in memory to compute a perceptual hash, and decoding images or
+ephemeral video frames in memory for face detection), and writes results
+only under this project's own data/ and reports/ directories.
 """
 from __future__ import annotations
 
@@ -15,6 +16,11 @@ from typing import Optional
 
 from . import database
 from .classifier import classify
+from .face_detection import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_MIN_FACE_SIZE_PX,
+    detect_faces_in_image_file,
+)
 from .hashing import DuplicateRecord, find_duplicates
 from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
 from .video_sampling import compute_sample_timestamps, sample_video_frames
@@ -391,6 +397,216 @@ def run_sample_frames(
     conn.close()
 
 
+def run_detect_faces(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
+    max_video_samples: int = 30,
+    redact_paths: bool = False,
+    quiet: bool = False,
+    verify_readonly: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+) -> None:
+    """Detect faces in images and sampled video frames under target."""
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        print(
+            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
+            "punto de montaje o crea la carpeta esperada.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+
+    start = time.perf_counter()
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    walk_errors: list[ScanError] = []
+
+    def _on_error(err: ScanError) -> None:
+        walk_errors.append(err)
+        if not quiet and not redact_paths:
+            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
+
+    before_snapshot = None
+    if verify_readonly:
+        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(before_snapshot, snapshot_dir / "before.json")
+
+    conn = database.connect(db_path)
+    images_processed = 0
+    video_frames_processed = 0
+    face_observations = 0
+    detector_errors = 0
+    attempted_files: set[str] = set()
+    files_with_faces: set[str] = set()
+    processed_files = 0
+
+    for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
+        category = classify(file_path.suffix)
+        if category == "image":
+            images_processed += 1
+            processed_files += 1
+            attempted_files.add(str(file_path))
+            try:
+                result = detect_faces_in_image_file(
+                    file_path,
+                    confidence_threshold=confidence_threshold,
+                    min_face_size_px=min_face_size,
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad image never aborts the run
+                detector_errors += 1
+                if not quiet and not redact_paths:
+                    print(f"Detección {file_path}: error: {exc}")
+                continue
+            if result.error is not None:
+                detector_errors += 1
+                if not quiet and not redact_paths:
+                    print(f"Detección {file_path}: error: {result.error}")
+                continue
+            database.clear_face_observations(conn, str(file_path))
+            database.insert_face_observations(
+                conn, str(file_path), "image", result.faces, timestamp_ms=None
+            )
+            conn.commit()
+            face_observations += len(result.faces)
+            if result.faces:
+                files_with_faces.add(str(file_path))
+            if not quiet:
+                if redact_paths:
+                    if processed_files % 10 == 0 or processed_files == 1:
+                        print(f"Procesados {processed_files} archivos...")
+                else:
+                    print(f"Detección {file_path}: {len(result.faces)} caras")
+        elif category == "video":
+            processed_files += 1
+            attempted_files.add(str(file_path))
+            try:
+                video_meta = get_video_metadata(file_path)
+                if video_meta.error or video_meta.duration_seconds is None:
+                    result_error = video_meta.error or "no duration available"
+                    database.clear_face_observations(conn, str(file_path))
+                    database.clear_video_frame_samples(conn, str(file_path))
+                    conn.commit()
+                    detector_errors += 1
+                    if not quiet and not redact_paths:
+                        print(f"Detección {file_path}: error: {result_error}")
+                    continue
+                timestamps = compute_sample_timestamps(
+                    video_meta.duration_seconds, max_video_samples
+                )
+                detected: list = []
+
+                def _on_frame(frame_path: Path, timestamp: float, _idx: int) -> None:
+                    face_result = detect_faces_in_image_file(
+                        frame_path,
+                        confidence_threshold=confidence_threshold,
+                        min_face_size_px=min_face_size,
+                    )
+                    detected.append((timestamp, face_result))
+
+                sampling = sample_video_frames(
+                    file_path,
+                    timestamps,
+                    on_frame=_on_frame,
+                    keep_debug_frames=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
+                database.clear_face_observations(conn, str(file_path))
+                database.clear_video_frame_samples(conn, str(file_path))
+                conn.commit()
+                detector_errors += 1
+                if not quiet and not redact_paths:
+                    print(f"Detección {file_path}: error: {exc}")
+                continue
+
+            if sampling.video_error is not None:
+                database.clear_face_observations(conn, str(file_path))
+                database.clear_video_frame_samples(conn, str(file_path))
+                conn.commit()
+                detector_errors += 1
+                if not quiet and not redact_paths:
+                    print(f"Detección {file_path}: error: {sampling.video_error}")
+                continue
+
+            database.clear_face_observations(conn, str(file_path))
+            video_faces = 0
+            for timestamp, face_result in detected:
+                video_frames_processed += 1
+                if face_result.error is not None:
+                    continue
+                database.insert_face_observations(
+                    conn,
+                    str(file_path),
+                    "video_frame",
+                    face_result.faces,
+                    timestamp_ms=timestamp * 1000,
+                )
+                face_observations += len(face_result.faces)
+                video_faces += len(face_result.faces)
+            if video_faces:
+                files_with_faces.add(str(file_path))
+            database.clear_video_frame_samples(conn, str(file_path))
+            database.insert_video_frame_samples(conn, str(file_path), sampling.samples)
+            conn.commit()
+            if not quiet:
+                if redact_paths:
+                    if processed_files % 10 == 0 or processed_files == 1:
+                        print(f"Procesados {processed_files} archivos...")
+                else:
+                    print(
+                        f"Detección {file_path}: "
+                        f"{video_faces} caras en {len(detected)} frames"
+                    )
+
+    if verify_readonly:
+        after_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(after_snapshot, snapshot_dir / "after.json")
+        readonly_diff = diff_snapshots(before_snapshot, after_snapshot)
+        print()
+        print("=== VERIFICACIÓN READ-ONLY ===")
+        print(
+            f"added={len(readonly_diff.added)} removed={len(readonly_diff.removed)} "
+            f"size_changed={len(readonly_diff.size_changed)} "
+            f"mtime_changed={len(readonly_diff.mtime_changed)}"
+        )
+        if readonly_diff.is_clean:
+            print("OK: ningún archivo original cambió durante el escaneo.")
+        else:
+            print(
+                "ALERTA: se detectaron cambios en los archivos originales durante el escaneo.",
+                file=sys.stderr,
+            )
+            for label, paths in (
+                ("added", readonly_diff.added),
+                ("removed", readonly_diff.removed),
+                ("size_changed", readonly_diff.size_changed),
+                ("mtime_changed", readonly_diff.mtime_changed),
+            ):
+                for changed_path in paths[:20]:
+                    print(f"  [{label}] {changed_path}", file=sys.stderr)
+
+    files_with = len(files_with_faces)
+    files_without = len(attempted_files - files_with_faces)
+    elapsed_seconds = time.perf_counter() - start
+
+    print()
+    print("=== FACE DETECTION ===")
+    print(f"images_processed={images_processed}")
+    print(f"video_frames_processed={video_frames_processed}")
+    print(f"face_observations={face_observations}")
+    print(f"files_with_faces={files_with}")
+    print(f"files_without_faces={files_without}")
+    print(f"detector_errors={detector_errors}")
+    print(f"elapsed_seconds={elapsed_seconds:.2f}")
+    if walk_errors:
+        print(f"Directorios no listados por error de permisos: {len(walk_errors)}")
+
+    conn.close()
+
+
 def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     if not db_path.exists():
         print(
@@ -548,6 +764,21 @@ def build_parser() -> argparse.ArgumentParser:
     sample_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
     sample_parser.add_argument("--quiet", action="store_true")
 
+    faces_parser = subparsers.add_parser(
+        "detect-faces", help="Detectar caras en imágenes y frames de video (todo local)."
+    )
+    faces_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    faces_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    faces_parser.add_argument(
+        "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
+    )
+    faces_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    faces_parser.add_argument("--max-video-samples", type=int, default=30)
+    faces_parser.add_argument("--redact-paths", action="store_true")
+    faces_parser.add_argument("--verify-readonly", action="store_true")
+    faces_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    faces_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -579,6 +810,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             max_samples=args.max_samples,
             keep_debug_frames=args.keep_debug_frames,
             debug_dir=args.debug_dir,
+            redact_paths=args.redact_paths,
+            quiet=args.quiet,
+            verify_readonly=args.verify_readonly,
+            snapshot_dir=args.snapshot_dir,
+        )
+    elif args.command == "detect-faces":
+        run_detect_faces(
+            target=args.target,
+            db_path=args.db,
+            confidence_threshold=args.confidence_threshold,
+            min_face_size=args.min_face_size,
+            max_video_samples=args.max_video_samples,
             redact_paths=args.redact_paths,
             quiet=args.quiet,
             verify_readonly=args.verify_readonly,
