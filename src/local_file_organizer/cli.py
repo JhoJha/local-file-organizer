@@ -47,6 +47,7 @@ from .snapshot import capture_snapshot, diff_snapshots, save_snapshot
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "catalog.sqlite"
 DEFAULT_CSV_PATH = PROJECT_ROOT / "reports" / "inventory.csv"
+DEFAULT_PLAN_PATH = PROJECT_ROOT / "reports" / "organization_plan.json"
 DEFAULT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "snapshots"
 DEFAULT_DEBUG_FRAMES_DIR = PROJECT_ROOT / "data" / "debug_frames"
 
@@ -858,6 +859,208 @@ def run_cluster_people(
     conn.close()
 
 
+def run_organize_preview(
+    db_path: Path = DEFAULT_DB_PATH,
+    plan_path: Path = DEFAULT_PLAN_PATH,
+    show_files: bool = False,
+    quiet: bool = False,
+) -> None:
+    """Build the read-only organization preview from the SQLite catalog.
+
+    Only reads the catalog database and writes ``reports/organization_plan.json``;
+    never walks the filesystem or touches the scanned tree.
+    """
+    from .organization_plan import (
+        build_organization_plan,
+        plan_counts,
+        write_plan_json,
+    )
+
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    try:
+        count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+    except Exception:
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        conn.close()
+        raise SystemExit(1)
+    if (count_row[0] if count_row else 0) == 0:
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        conn.close()
+        raise SystemExit(1)
+
+    entries = build_organization_plan(conn)
+    counts = plan_counts(entries)
+    by_destination: dict[str, int] = counts["by_destination"]
+    write_plan_json(entries, plan_path)
+
+    paths_by_destination: dict[str, list[str]] = {}
+    if show_files:
+        rows = conn.execute("SELECT path FROM files ORDER BY path ASC").fetchall()
+        dest_by_index = [e["proposed_destination"] for e in entries]
+        for row, dest in zip(rows, dest_by_index):
+            paths_by_destination.setdefault(dest, []).append(row["path"])
+    conn.close()
+
+    def _files_word(n: int) -> str:
+        return "1 archivo" if n == 1 else f"{n} archivos"
+
+    def _leaf_line(name: str, n: int) -> str:
+        return f"{name}  {_files_word(n)}"
+
+    lines = ["=== ORGANIZATION PREVIEW ===", ""]
+
+    media_dests = {d: c for d, c in by_destination.items() if d.startswith("Media/")}
+    if media_dests:
+        lines.append("Media/")
+        personas = sorted(
+            (d, c) for d, c in media_dests.items() if d.startswith("Media/Personas/")
+        )
+        parejas = sorted(
+            (d, c) for d, c in media_dests.items() if d.startswith("Media/Parejas/")
+        )
+        grupos = sorted(
+            (d, c) for d, c in media_dests.items() if d.startswith("Media/Grupos/")
+        )
+        sin = media_dests.get("Media/Sin_personas/")
+        if personas:
+            lines.append("  Personas/")
+            for dest, c in personas:
+                label = dest.split("/")[2]
+                lines.append(f"    {label}/  {_files_word(c)}")
+                if show_files:
+                    for p in sorted(paths_by_destination.get(dest, [])):
+                        lines.append(f"      - {p}")
+        if parejas:
+            lines.append("  Parejas/")
+            for dest, c in parejas:
+                label = dest.split("/")[2]
+                lines.append(f"    {label}/  {_files_word(c)}")
+                if show_files:
+                    for p in sorted(paths_by_destination.get(dest, [])):
+                        lines.append(f"      - {p}")
+        if grupos:
+            lines.append("  Grupos/")
+            for dest, c in grupos:
+                label = dest.split("/")[2]
+                lines.append(f"    {label}/  {_files_word(c)}")
+                if show_files:
+                    for p in sorted(paths_by_destination.get(dest, [])):
+                        lines.append(f"      - {p}")
+        if sin:
+            lines.append(f"  {_leaf_line('Sin_personas/', sin)}")
+            if show_files:
+                for p in sorted(
+                    paths_by_destination.get("Media/Sin_personas/", [])
+                ):
+                    lines.append(f"      - {p}")
+        lines.append("")
+
+    documentos = sorted(
+        (d, c) for d, c in by_destination.items() if d.startswith("Documentos/")
+    )
+    if documentos:
+        lines.append("Documentos/")
+        for dest, c in documentos:
+            label = dest.split("/")[1]
+            lines.append(f"  {_leaf_line(label + '/', c)}")
+            if show_files:
+                for p in sorted(paths_by_destination.get(dest, [])):
+                    lines.append(f"    - {p}")
+        lines.append("")
+
+    audios = sorted(
+        (d, c) for d, c in by_destination.items() if d.startswith("Audio/")
+    )
+    if audios:
+        lines.append("Audio/")
+        for dest, c in audios:
+            label = dest.split("/")[1]
+            lines.append(f"  {_leaf_line(label + '/', c)}")
+            if show_files:
+                for p in sorted(paths_by_destination.get(dest, [])):
+                    lines.append(f"    - {p}")
+        lines.append("")
+
+    if by_destination.get("Archivos_comprimidos/"):
+        n = by_destination["Archivos_comprimidos/"]
+        lines.append(f"Archivos_comprimidos/  {_files_word(n)}")
+        if show_files:
+            for p in sorted(paths_by_destination.get("Archivos_comprimidos/", [])):
+                lines.append(f"  - {p}")
+        lines.append("")
+
+    if by_destination.get("Software/"):
+        n = by_destination["Software/"]
+        lines.append(f"Software/  {_files_word(n)}")
+        if show_files:
+            for p in sorted(paths_by_destination.get("Software/", [])):
+                lines.append(f"  - {p}")
+        lines.append("")
+
+    otros = sorted(
+        (d, c) for d, c in by_destination.items() if d.startswith("Otros/")
+    )
+    if otros:
+        lines.append("Otros/")
+        for dest, c in otros:
+            label = dest.split("/")[1]
+            lines.append(f"  {_leaf_line(label + '/', c)}")
+            if show_files:
+                for p in sorted(paths_by_destination.get(dest, [])):
+                    lines.append(f"    - {p}")
+        lines.append("")
+
+    revision = {d: c for d, c in by_destination.items() if d.startswith("Revisión/")}
+    if revision:
+        lines.append("Revisión/")
+        if revision.get("Revisión/Metadata_incompleta/"):
+            n = revision["Revisión/Metadata_incompleta/"]
+            lines.append(f"  {_leaf_line('Metadata_incompleta/', n)}")
+            if show_files:
+                for p in sorted(
+                    paths_by_destination.get("Revisión/Metadata_incompleta/", [])
+                ):
+                    lines.append(f"    - {p}")
+        if revision.get("Revisión/Errores_de_escaneo/"):
+            n = revision["Revisión/Errores_de_escaneo/"]
+            lines.append(f"  {_leaf_line('Errores_de_escaneo/', n)}")
+            if show_files:
+                for p in sorted(
+                    paths_by_destination.get("Revisión/Errores_de_escaneo/", [])
+                ):
+                    lines.append(f"    - {p}")
+        lines.append("")
+
+    lines.append("FLAGS:")
+    lines.append(f"exact_duplicates={counts['exact_duplicates']}")
+    lines.append(f"visual_similar_groups={counts['visual_similar_groups']}")
+    lines.append("")
+    lines.append("=== ACCOUNTING ===")
+    lines.append(f"catalog_files={counts['catalog_files']}")
+    lines.append(f"planned={counts['planned']}")
+    lines.append(f"review={counts['review']}")
+    lines.append(f"unsupported={counts['unsupported']}")
+    lines.append("")
+    lines.append("PREVIEW ONLY")
+    lines.append("moved=0")
+    lines.append("copied=0")
+    lines.append("renamed=0")
+    lines.append("deleted=0")
+    print("\n".join(lines))
+
+
 def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     if not db_path.exists():
         print(
@@ -1059,6 +1262,22 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
     cluster_parser.add_argument("--quiet", action="store_true")
 
+    preview_parser = subparsers.add_parser(
+        "organize-preview", help="Vista previa de organización (solo lectura)."
+    )
+    preview_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    preview_parser.add_argument("--plan-path", type=Path, default=DEFAULT_PLAN_PATH)
+    preview_parser.add_argument(
+        "--show-files",
+        action="store_true",
+        help=(
+            "Muestra las rutas reales de cada archivo bajo cada destino. "
+            "Pensado para que lo ejecutes tú manualmente — no debe usarse "
+            "en sesiones automatizadas."
+        ),
+    )
+    preview_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -1119,6 +1338,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             quiet=args.quiet,
             verify_readonly=args.verify_readonly,
             snapshot_dir=args.snapshot_dir,
+        )
+    elif args.command == "organize-preview":
+        run_organize_preview(
+            db_path=args.db,
+            plan_path=args.plan_path,
+            show_files=args.show_files,
+            quiet=args.quiet,
         )
 
 

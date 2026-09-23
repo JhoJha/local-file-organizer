@@ -1046,5 +1046,140 @@ class ClusterPeopleCliTests(unittest.TestCase):
         self.assertTrue(diff_snapshots(before, after).is_clean)
 
 
+class OrganizePreviewCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.output_dir = Path(self.tmpdir.name) / "output"
+        self.output_dir.mkdir()
+        self.db_path = self.output_dir / "catalog.sqlite"
+        self.plan_path = self.output_dir / "organization_plan.json"
+
+    def _seed(self):
+        from local_file_organizer import database
+
+        conn = database.connect(self.db_path)
+        base = str(Path(self.tmpdir.name) / "media")
+        self.p_single = base + "/single.jpg"
+        self.p_zero = base + "/zero.jpg"
+        self.p_doc = base + "/informe.pdf"
+        self.p_review = base + "/rota.jpg"
+        self.p_bad = base + "/ilegible.jpg"
+        conn.execute("DELETE FROM person_cluster_members")
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=self.p_single, name="single.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="ok"),
+        )
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=self.p_zero, name="zero.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="ok"),
+        )
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=self.p_doc, name="informe.pdf", extension=".pdf",
+                category="document", scan_status="ok", metadata_status="skipped",
+                duplicate_group="DUP_00001"),
+        )
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=self.p_review, name="rota.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="error"),
+        )
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=self.p_bad, name="ilegible.jpg", extension=".jpg",
+                category="image", scan_status="error", metadata_status="skipped",
+                similar_group="SIM_00001"),
+        )
+        database.insert_person_cluster_members(
+            conn, [("P0004", self.p_single, "image", 1)])
+        conn.commit()
+        conn.close()
+        return [self.p_single, self.p_zero, self.p_doc, self.p_review, self.p_bad]
+
+    def test_end_to_end_tree_accounting_and_privacy(self):
+        import json
+
+        from local_file_organizer.cli import run_organize_preview
+
+        secrets = self._seed()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path, quiet=True)
+        printed = output.getvalue()
+        for token in (
+            "=== ORGANIZATION PREVIEW ===",
+            "Media/", "Personas/", "P0004/", "Sin_personas/",
+            "Documentos/", "PDF/",
+            "Revisión/", "Metadata_incompleta/", "Errores_de_escaneo/",
+            "FLAGS:", "exact_duplicates=", "visual_similar_groups=",
+            "=== ACCOUNTING ===",
+            "catalog_files=5", "planned=3", "review=1", "unsupported=1",
+            "PREVIEW ONLY", "moved=0", "copied=0", "renamed=0", "deleted=0",
+        ):
+            self.assertIn(token, printed)
+        for secret in secrets:
+            self.assertNotIn(secret, printed)
+
+        self.assertTrue(self.plan_path.exists())
+        data = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data), 5)
+        for entry in data:
+            self.assertEqual(
+                set(entry.keys()),
+                {"file_id", "category", "bucket", "proposed_destination",
+                 "reason_codes", "flags", "confidence", "action"})
+        serialized = self.plan_path.read_text(encoding="utf-8")
+        for secret in secrets:
+            self.assertNotIn(secret, serialized)
+
+    def test_show_files_reveals_paths(self):
+        from local_file_organizer.cli import run_organize_preview
+
+        secrets = self._seed()
+        default_out = io.StringIO()
+        with redirect_stdout(default_out):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path, quiet=True)
+        self.assertNotIn(secrets[0], default_out.getvalue())
+
+        shown_out = io.StringIO()
+        with redirect_stdout(shown_out):
+            run_organize_preview(
+                db_path=self.db_path, plan_path=self.plan_path,
+                show_files=True, quiet=True)
+        self.assertIn(secrets[0], shown_out.getvalue())
+
+    def test_missing_or_empty_catalog_errors(self):
+        from local_file_organizer.cli import run_organize_preview
+
+        missing = self.output_dir / "no-existe.sqlite"
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                with redirect_stdout(io.StringIO()):
+                    run_organize_preview(
+                        db_path=missing, plan_path=self.plan_path, quiet=True)
+
+        from local_file_organizer import database
+
+        conn = database.connect(self.db_path)
+        conn.close()
+        err = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(err):
+                with redirect_stdout(io.StringIO()):
+                    run_organize_preview(
+                        db_path=self.db_path, plan_path=self.plan_path, quiet=True)
+        self.assertIn("ERROR: no existe el catálogo", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

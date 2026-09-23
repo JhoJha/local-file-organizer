@@ -57,7 +57,7 @@ class SafetyGateTests(unittest.TestCase):
         # CLI (defaulting to this project's own data/ and reports/
         # directories), never to the scanned tree. Every other module may
         # only *read* (stat, open for reading, hash).
-        allowed_write_files = {"database.py", "reporting.py", "snapshot.py"}
+        allowed_write_files = {"database.py", "reporting.py", "snapshot.py", "organization_plan.py"}
         write_call_patterns = [
             r"open\(([^)]*)\)",
             r"\.write_text\s*\(",

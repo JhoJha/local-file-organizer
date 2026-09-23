@@ -79,6 +79,7 @@ python -m local_file_organizer similar-images
 python -m local_file_organizer sample-frames /ruta/a/analizar
 python -m local_file_organizer detect-faces /ruta/a/analizar
 python -m local_file_organizer cluster-people /ruta/a/analizar
+python -m local_file_organizer organize-preview
 ```
 
 Opciones de `scan`:
@@ -468,6 +469,56 @@ Cada fila en `files` distingue dos fallos independientes:
   queda con `scan_status='ok'` (se pudo inventariar) y
   `metadata_status='error'` con el motivo de Pillow en `metadata_error`.
 
+## Vista previa de organización (V2.5)
+
+`organize-preview` es una simulación de solo lectura: lee el catálogo
+SQLite existente (`files`, columnas `duplicate_group`/`similar_group`, y
+`person_cluster_members`) y escribe `reports/organization_plan.json`, sin
+recorrer el sistema de archivos ni mover, copiar, renombrar o borrar nada
+(`moved=0, copied=0, renamed=0, deleted=0`). No existe ningún
+`organize-apply` todavía: los movimientos reales son trabajo futuro
+explícito (V2.6+, no implementado).
+
+Tres familias de destinos:
+
+- `Media/` por conteo de personas (clusters V2.4): `Sin_personas/`,
+  `Personas/{P000N}/`, `Parejas/{PAIR_000N}/`, `Grupos/{GROUP_000N}/`.
+- `Documentos/{EXT}/`, `Audio/{EXT}/`, `Archivos_comprimidos/`,
+  `Software/`, `Otros/{EXT}/` o `Otros/Sin_extension/` por extensión.
+- `Revisión/` para casos de baja confianza: `Metadata_incompleta/`
+  (inventario ok pero extracción especializada falló) y
+  `Errores_de_escaneo/` (falló el inventario básico).
+
+Invariante contable: `catalog_files = planned + review + unsupported`.
+Cada archivo cae en exactamente un bucket: `unsupported`
+(`scan_status='error'`), `review` (`scan_status='ok'`, imagen/video con
+`metadata_status='error'`), o `planned` (todo lo demás, incluyendo
+`other` y multimedia con `metadata_status` `ok`/`skipped`).
+
+A diferencia de `data/catalog.sqlite` (que sí contiene rutas reales),
+`reports/organization_plan.json` nunca contiene rutas: solo ids opacos
+`F000NNN` (asignados por orden alfabético de `path`, recalculados en cada
+ejecución), más `PAIR_000N`/`GROUP_000N` deterministas por conjunto de
+personas. Los duplicados exactos (`exact_duplicate`) y grupos visuales
+(`visual_similar_group`) son solo flags informativos: no se propone
+borrado ni se elige copia principal.
+
+```bash
+python -m local_file_organizer organize-preview
+python -m local_file_organizer organize-preview --db data/catalog.sqlite --plan-path reports/organization_plan.json
+```
+
+Flags: `--db`, `--plan-path`, `--show-files`, `--quiet`. `--show-files`
+muestra las rutas reales bajo cada destino y es solo para que lo ejecutes
+tú manualmente: Claude/Muse nunca debe invocarlo contra datos personales
+reales durante una sesión de desarrollo (la salida por defecto nunca
+contiene rutas).
+
+Limitación conocida: una imagen/video que nunca pasó por
+`detect-faces`/`cluster-people` (sin filas en `person_cluster_members`)
+cae en `Media/Sin_personas/`, no en `Revisión/`: "cero caras confirmadas"
+y "nunca analizado" son indistinguibles en este hito.
+
 ## Frontera de privacidad (futuro)
 
 Esta V1 no se conecta a ningún proveedor externo. Se documenta aquí, de
@@ -507,8 +558,10 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   persistidos) y clustering anónimo de personas (`cluster-people`, tabla
   `person_cluster_members`, etiquetas `P0001`, …); agrupa quién-aparece-
   dónde sin identificar a nadie.
-- V2.5+: vista previa de organización (`plan.json`), pares/grupos de
-  coocurrencia.
+- V2.5 (implementado): vista previa de organización read-only
+  (`organize-preview`, `reports/organization_plan.json`), pares/grupos de
+  coocurrencia (`PAIR_000N`/`GROUP_000N`). V2.6 (`organize-apply`,
+  movimientos reales) no existe todavía.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.
