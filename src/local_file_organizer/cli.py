@@ -1,4 +1,4 @@
-"""Command-line interface: scan, summary, duplicates, similar-images.
+"""Command-line interface: scan, summary, duplicates, similar-images, sample-frames.
 
 Every code path in this module is read-only with respect to the scanned
 tree: it lists files, reads their metadata/bytes (including decoding
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,7 @@ from . import database
 from .classifier import classify
 from .hashing import DuplicateRecord, find_duplicates
 from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
+from .video_sampling import compute_sample_timestamps, sample_video_frames
 from .perceptual_hash import (
     DEFAULT_SIMILARITY_THRESHOLD,
     SimilarityRecord,
@@ -31,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "catalog.sqlite"
 DEFAULT_CSV_PATH = PROJECT_ROOT / "reports" / "inventory.csv"
 DEFAULT_SNAPSHOT_DIR = PROJECT_ROOT / "data" / "snapshots"
+DEFAULT_DEBUG_FRAMES_DIR = PROJECT_ROOT / "data" / "debug_frames"
 
 _PROGRESS_INTERVAL = 500
 
@@ -232,6 +235,162 @@ def run_scan(
     conn.close()
 
 
+def run_sample_frames(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    max_samples: int = 30,
+    keep_debug_frames: bool = False,
+    debug_dir: Path = DEFAULT_DEBUG_FRAMES_DIR,
+    redact_paths: bool = False,
+    quiet: bool = False,
+    verify_readonly: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+) -> None:
+    """Sample ephemeral video frames for every video under target."""
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        print(
+            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
+            "punto de montaje o crea la carpeta esperada.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+
+    start = time.perf_counter()
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    walk_errors: list[ScanError] = []
+
+    def _on_error(err: ScanError) -> None:
+        walk_errors.append(err)
+        if not quiet and not redact_paths:
+            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
+
+    before_snapshot = None
+    if verify_readonly:
+        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(before_snapshot, snapshot_dir / "before.json")
+
+    conn = database.connect(db_path)
+    ephemeral_dirs: list[Path] = []
+    videos = 0
+    videos_ok = 0
+    videos_error = 0
+    frames_generated = 0
+    frames_failed = 0
+
+    for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
+        if classify(file_path.suffix) != "video":
+            continue
+        video_index = videos
+        videos += 1
+
+        def _on_frame(frame_path: Path, _ts: float, _idx: int) -> None:
+            parent = frame_path.parent
+            if parent not in ephemeral_dirs:
+                ephemeral_dirs.append(parent)
+
+        try:
+            video_meta = get_video_metadata(file_path)
+            if video_meta.error or video_meta.duration_seconds is None:
+                result_error = video_meta.error or "no duration available"
+                database.clear_video_frame_samples(conn, str(file_path))
+                conn.commit()
+                videos_error += 1
+                if not quiet and not redact_paths:
+                    print(f"Muestreo {file_path}: error: {result_error}")
+                continue
+            timestamps = compute_sample_timestamps(video_meta.duration_seconds, max_samples)
+            per_video_debug: Optional[Path] = None
+            if keep_debug_frames:
+                per_video_debug = debug_dir / f"{video_index:04d}"
+                per_video_debug.mkdir(parents=True, exist_ok=True)
+            result = sample_video_frames(
+                file_path,
+                timestamps,
+                on_frame=_on_frame,
+                keep_debug_frames=keep_debug_frames,
+                debug_dir=per_video_debug,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
+            database.clear_video_frame_samples(conn, str(file_path))
+            conn.commit()
+            videos_error += 1
+            if not quiet and not redact_paths:
+                print(f"Muestreo {file_path}: error: {exc}")
+            continue
+
+        database.clear_video_frame_samples(conn, str(file_path))
+        database.insert_video_frame_samples(conn, str(file_path), result.samples)
+        conn.commit()
+        frames_generated += result.frames_generated
+        frames_failed += result.frames_failed
+        if result.video_error is None:
+            videos_ok += 1
+        else:
+            videos_error += 1
+        if not quiet:
+            if redact_paths:
+                if videos % 10 == 0 or videos == 1:
+                    print(f"Procesados {videos} videos...")
+            else:
+                print(
+                    f"Muestreo {file_path}: "
+                    f"{result.frames_generated} generados, {result.frames_failed} fallidos"
+                    + (f" ({result.video_error})" if result.video_error else "")
+                )
+
+    if verify_readonly:
+        after_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(after_snapshot, snapshot_dir / "after.json")
+        readonly_diff = diff_snapshots(before_snapshot, after_snapshot)
+        print()
+        print("=== VERIFICACIÓN READ-ONLY ===")
+        print(
+            f"added={len(readonly_diff.added)} removed={len(readonly_diff.removed)} "
+            f"size_changed={len(readonly_diff.size_changed)} "
+            f"mtime_changed={len(readonly_diff.mtime_changed)}"
+        )
+        if readonly_diff.is_clean:
+            print("OK: ningún archivo original cambió durante el escaneo.")
+        else:
+            print(
+                "ALERTA: se detectaron cambios en los archivos originales durante el escaneo.",
+                file=sys.stderr,
+            )
+            for label, paths in (
+                ("added", readonly_diff.added),
+                ("removed", readonly_diff.removed),
+                ("size_changed", readonly_diff.size_changed),
+                ("mtime_changed", readonly_diff.mtime_changed),
+            ):
+                for changed_path in paths[:20]:
+                    print(f"  [{label}] {changed_path}", file=sys.stderr)
+
+    temporary_frames_remaining = 0
+    for ephemeral in ephemeral_dirs:
+        if ephemeral.exists():
+            remaining_files = [p for p in ephemeral.rglob("*") if p.is_file()]
+            temporary_frames_remaining += len(remaining_files)
+    elapsed_seconds = time.perf_counter() - start
+
+    print()
+    print("=== VIDEO FRAME SAMPLING ===")
+    print(f"videos={videos}")
+    print(f"videos_ok={videos_ok}")
+    print(f"videos_error={videos_error}")
+    print(f"frames_generated={frames_generated}")
+    print(f"frames_failed={frames_failed}")
+    print(f"temporary_frames_remaining={temporary_frames_remaining}")
+    print(f"elapsed_seconds={elapsed_seconds:.2f}")
+    if walk_errors:
+        print(f"Directorios no listados por error de permisos: {len(walk_errors)}")
+
+    conn.close()
+
+
 def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     if not db_path.exists():
         print(
@@ -376,6 +535,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     similar_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
 
+    sample_parser = subparsers.add_parser(
+        "sample-frames", help="Muestrear frames de video de forma efímera (solo lectura)."
+    )
+    sample_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    sample_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    sample_parser.add_argument("--max-samples", type=int, default=30)
+    sample_parser.add_argument("--keep-debug-frames", action="store_true")
+    sample_parser.add_argument("--debug-dir", type=Path, default=DEFAULT_DEBUG_FRAMES_DIR)
+    sample_parser.add_argument("--redact-paths", action="store_true")
+    sample_parser.add_argument("--verify-readonly", action="store_true")
+    sample_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    sample_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -400,6 +572,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         run_duplicates(db_path=args.db)
     elif args.command == "similar-images":
         run_similar_images(db_path=args.db)
+    elif args.command == "sample-frames":
+        run_sample_frames(
+            target=args.target,
+            db_path=args.db,
+            max_samples=args.max_samples,
+            keep_debug_frames=args.keep_debug_frames,
+            debug_dir=args.debug_dir,
+            redact_paths=args.redact_paths,
+            quiet=args.quiet,
+            verify_readonly=args.verify_readonly,
+            snapshot_dir=args.snapshot_dir,
+        )
 
 
 if __name__ == "__main__":

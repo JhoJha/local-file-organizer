@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS files (
     metadata_status TEXT,
     metadata_error TEXT
 );
+CREATE TABLE IF NOT EXISTS video_frame_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path TEXT NOT NULL,
+    sample_index INTEGER NOT NULL,
+    timestamp_seconds REAL NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_video_frame_samples_path ON video_frame_samples(file_path);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -124,7 +133,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute(SCHEMA)
+    conn.executescript(SCHEMA)
     _migrate_added_columns(conn)
     conn.commit()
 
@@ -287,3 +296,41 @@ def fetch_similar_files(conn: sqlite3.Connection, group_id: Optional[str] = None
 def fetch_perceptual_hash_count(conn: sqlite3.Connection) -> int:
     cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
     return cur.fetchone()[0]
+
+
+def clear_video_frame_samples(conn: sqlite3.Connection, file_path: str) -> None:
+    conn.execute("DELETE FROM video_frame_samples WHERE file_path = ?", (file_path,))
+
+
+def insert_video_frame_samples(conn: sqlite3.Connection, file_path: str, samples: list) -> None:
+    """Bulk-insert frame sampling outcomes for one video file."""
+    if not samples:
+        return
+    conn.executemany(
+        "INSERT INTO video_frame_samples "
+        "(file_path, sample_index, timestamp_seconds, status, error) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (file_path, s.sample_index, s.timestamp_seconds, s.status, s.error)
+            for s in samples
+        ],
+    )
+
+
+def fetch_video_frame_sample_counts(
+    conn: sqlite3.Connection, file_path: Optional[str] = None
+) -> dict[str, int]:
+    """Return aggregate generated/error sample counts, globally or for one file."""
+    if file_path is None:
+        cur = conn.execute("SELECT status, COUNT(*) AS n FROM video_frame_samples GROUP BY status")
+    else:
+        cur = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM video_frame_samples "
+            "WHERE file_path = ? GROUP BY status",
+            (file_path,),
+        )
+    counts = {"generated": 0, "error": 0}
+    for row in cur.fetchall():
+        if row["status"] in counts:
+            counts[row["status"]] = row["n"]
+    return counts

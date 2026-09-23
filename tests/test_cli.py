@@ -1,10 +1,11 @@
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from PIL import Image
@@ -380,6 +381,158 @@ class RunScanTests(unittest.TestCase):
         after = load_snapshot(snapshot_dir / "after.json")
         diff = diff_snapshots(before, after)
         self.assertTrue(diff.is_clean)
+
+
+class SampleFramesCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.target = Path(self.tmpdir.name) / "target"
+        self.target.mkdir()
+        self.output_dir = Path(self.tmpdir.name) / "output"
+        self.output_dir.mkdir()
+        self.db_path = self.output_dir / "catalog.sqlite"
+
+    def _make_video(self, name: str, duration: float = 2.0) -> Path:
+        out = self.target / name
+        subprocess.run(
+            [
+                "ffmpeg", "-f", "lavfi", "-i",
+                f"testsrc=duration={duration}:size=160x120:rate=10",
+                "-y", str(out),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        return out
+
+    @unittest.skipUnless(
+        ffprobe_available() and shutil.which("ffmpeg") is not None,
+        "ffmpeg/ffprobe not installed",
+    )
+    def test_sample_frames_cli_end_to_end(self):
+        from local_file_organizer.cli import run_sample_frames
+
+        self._make_video("clip1.mp4")
+        self._make_video("clip2.mp4")
+        (self.target / "notes.txt").write_text("not a video")
+
+        snapshot_dir = self.output_dir / "snapshots"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_sample_frames(
+                self.target,
+                db_path=self.db_path,
+                quiet=True,
+                verify_readonly=True,
+                snapshot_dir=snapshot_dir,
+            )
+        printed = output.getvalue()
+        self.assertIn("=== VIDEO FRAME SAMPLING ===", printed)
+        self.assertIn("temporary_frames_remaining=0", printed)
+        self.assertIn("=== VERIFICACIÓN READ-ONLY ===", printed)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM video_frame_samples").fetchall()
+        video_paths = {r["file_path"] for r in rows}
+        self.assertTrue(rows)
+        self.assertIn(str(self.target / "clip1.mp4"), video_paths)
+        self.assertIn(str(self.target / "clip2.mp4"), video_paths)
+        self.assertNotIn(str(self.target / "notes.txt"), video_paths)
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM video_frame_samples WHERE file_path = ?",
+            (str(self.target / "clip1.mp4"),),
+        ).fetchone()[0]
+        conn.close()
+
+        before = load_snapshot(snapshot_dir / "before.json")
+        after = load_snapshot(snapshot_dir / "after.json")
+        self.assertTrue(diff_snapshots(before, after).is_clean)
+
+        # Re-running must replace rows, not accumulate them.
+        with redirect_stdout(io.StringIO()):
+            run_sample_frames(self.target, db_path=self.db_path, quiet=True)
+        conn = sqlite3.connect(str(self.db_path))
+        count_after = conn.execute(
+            "SELECT COUNT(*) FROM video_frame_samples WHERE file_path = ?",
+            (str(self.target / "clip1.mp4"),),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count_before, count_after)
+
+    @unittest.skipUnless(
+        ffprobe_available() and shutil.which("ffmpeg") is not None,
+        "ffmpeg/ffprobe not installed",
+    )
+    def test_sample_frames_redact_paths_hides_temp_dir(self):
+        from local_file_organizer.cli import main
+
+        self._make_video("clip.mp4")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            main(
+                [
+                    "sample-frames", str(self.target),
+                    "--db", str(self.db_path),
+                    "--redact-paths",
+                    "--quiet",
+                ]
+            )
+        printed = output.getvalue()
+        self.assertIn("=== VIDEO FRAME SAMPLING ===", printed)
+        self.assertNotIn(str(self.target), printed)
+        self.assertNotIn(self.tmpdir.name, printed)
+
+    @unittest.skipUnless(
+        ffprobe_available() and shutil.which("ffmpeg") is not None,
+        "ffmpeg/ffprobe not installed",
+    )
+    def test_sample_frames_redact_paths_hides_walk_errors(self):
+        from unittest import mock
+
+        from local_file_organizer.cli import run_sample_frames
+        from local_file_organizer.scanner import ScanError
+        from local_file_organizer.scanner import iter_files as real_iter_files
+
+        self._make_video("clip.mp4")
+        secret = str(self.target / "secret-dir")
+
+        def _fake_iter_files(root, ignored_dirs=frozenset(), on_error=None):
+            if on_error is not None:
+                on_error(ScanError(path=secret, message="permission denied"))
+            yield from real_iter_files(
+                root, ignored_dirs=ignored_dirs, on_error=on_error
+            )
+
+        with mock.patch(
+            "local_file_organizer.cli.iter_files", side_effect=_fake_iter_files
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                run_sample_frames(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=True,
+                    quiet=False,
+                )
+            redacted = out.getvalue() + err.getvalue()
+            self.assertIn("=== VIDEO FRAME SAMPLING ===", out.getvalue())
+            self.assertNotIn(secret, redacted)
+
+            # Sanity check: without --redact-paths the same walk error IS
+            # reported with its path, proving the redacted run above
+            # actually exercised the error path.
+            out2, err2 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out2), redirect_stderr(err2):
+                run_sample_frames(
+                    self.target,
+                    db_path=self.db_path,
+                    redact_paths=False,
+                    quiet=False,
+                )
+            self.assertIn(secret, err2.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# local-file-organizer (V2.1 — inventario read-only + similitud visual)
+# local-file-organizer (V2.2 — inventario read-only + similitud visual + muestreo de frames)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -24,12 +24,17 @@ servicios en la nube ni usa IA generativa.
    duplicadas: usa UPSERT sobre `path`).
 8. Exporta `reports/inventory.csv`.
 9. Imprime un resumen estadístico al finalizar.
+10. (V2.2) `sample-frames` muestrea frames de video de forma efímera con
+    `ffmpeg` y guarda solo los resultados (índice, timestamp, estado) en
+    `video_frame_samples` — ver
+    [Muestreo de frames de video (V2.2)](#muestreo-de-frames-de-video-v22).
 
 ## Qué NO hace (por diseño)
 
 No mueve, copia, renombra ni borra archivos; no modifica metadatos ni
 timestamps originales; no usa IA generativa ni APIs externas; no sube nada
-a la nube; no hace reconocimiento facial ni extrae frames de video; no
+a la nube; no hace reconocimiento facial (los frames de video solo se
+extraen de forma efímera para alimentar análisis locales futuros); no
 reorganiza carpetas.
 
 ## Requisitos
@@ -57,6 +62,7 @@ python -m local_file_organizer scan /ruta/a/analizar
 python -m local_file_organizer summary
 python -m local_file_organizer duplicates
 python -m local_file_organizer similar-images
+python -m local_file_organizer sample-frames /ruta/a/analizar
 ```
 
 Opciones de `scan`:
@@ -76,6 +82,21 @@ Opciones de `scan`:
 
 `similar-images` acepta `--db RUTA` y lista los grupos ya calculados por el
 último `scan` (no vuelve a leer las imágenes).
+
+Opciones de `sample-frames`:
+
+- `--db RUTA` — ruta del catálogo SQLite (por defecto `data/catalog.sqlite`).
+- `--max-samples N` — tope de frames por video (por defecto `30`).
+- `--keep-debug-frames` — guarda los frames extraídos bajo `--debug-dir`
+  en vez de borrarlos (solo para depuración manual).
+- `--debug-dir RUTA` — dónde guardar los frames de depuración (por defecto
+  `data/debug_frames/`).
+- `--redact-paths` — no imprime rutas por video, solo progreso agregado.
+- `--verify-readonly` — igual que en `scan`: snapshot antes/después y
+  bloque `=== VERIFICACIÓN READ-ONLY ===`.
+- `--snapshot-dir RUTA` — dónde guardar `before.json`/`after.json` (por
+  defecto `data/snapshots/`).
+- `--quiet` — reduce mensajes de progreso.
 
 Necesitas tener el paquete en el `PYTHONPATH`, por ejemplo ejecutando desde
 la raíz del repo con:
@@ -174,9 +195,10 @@ distintos.
 ### Limitaciones de esta iteración
 
 - Solo imágenes (`category = 'image'`); **no** hay hashing perceptual de
-  video, extracción de frames, ni nada relacionado con detección facial,
+  video, ni nada relacionado con detección facial,
   embeddings, clustering de personas u OCR — eso queda para iteraciones
-  futuras.
+  futuras. (La extracción efímera de frames vive en V2.2 como paso previo,
+  sin análisis facial.)
 - El umbral es global por escaneo, no ajustable por grupo.
 - El algoritmo no es robusto a rotaciones grandes, espejados ni recortes
   agresivos — solo a recompresión, reescalado moderado y pequeños cambios
@@ -193,6 +215,49 @@ máxima dentro del grupo, y la ruta/tamaño/extensión de cada archivo. El
 resumen impreso por `scan` y `summary` también incluye cuántas imágenes
 tienen hash calculado, cuántos grupos se detectaron y cuántas imágenes
 quedaron agrupadas vs. únicas.
+
+## Muestreo de frames de video (V2.2)
+
+Para cada archivo de categoría `video`, `sample-frames` estima la duración
+con `ffprobe` y extrae una serie de frames con `ffmpeg` — sin enviar ningún
+frame, hash ni ruta a ningún servicio externo.
+
+### Estrategia de muestreo
+
+El número objetivo de muestras depende de la duración (antes de aplicar el
+tope `--max-samples`): hasta 60 s → 8 frames; hasta 300 s → 12; hasta
+900 s → 20; más → 30. Los timestamps se reparten uniformemente sobre la
+ventana útil `[margen, duración - margen]`, donde el margen es
+`max(duración * 0.05, 0.2)` segundos desde cada extremo (nunca más de la
+mitad de la duración), para evitar los negros de intro/outro. Nunca se
+incluyen `t=0` ni `t=duración` exactos, y el resultado siempre sale
+ordenado y sin duplicados.
+
+### Efímero por defecto
+
+Los frames se extraen a un directorio temporal que **siempre se elimina**
+al terminar cada video (incluso si el consumidor del frame lanza una
+excepción), y nunca se escribe nada dentro del árbol escaneado. El resumen
+final incluye `temporary_frames_remaining` (verificado de verdad: se
+comprueba que los directorios temporales ya no existen), que siempre debe
+ser `0`. La única excepción es `--keep-debug-frames`, un escape hatch solo
+para depuración manual que conserva los JPG bajo `data/debug_frames/`
+(ignorado por git) en subcarpetas `0000/`, `0001/`, … numeradas
+secuencialmente para no filtrar nombres de archivo.
+
+Cada video deja sus resultados (índice, timestamp, `generated`/`error`) en
+la tabla `video_frame_samples` del catálogo; re-ejecutar reemplaza las
+filas de ese video en vez de acumularlas. Un video corrupto no aborta el
+resto: sus muestras quedan en `error` y el programa sigue con el siguiente.
+
+Todavía **no** hay detección facial, embeddings ni clustering de personas:
+V2.2 solo demuestra que el pipeline de muestreo funciona y que los frames
+se limpian correctamente. Eso queda explícitamente para iteraciones
+futuras.
+
+```bash
+python -m local_file_organizer sample-frames /ruta/a/analizar
+```
 
 ## Modelo de errores por archivo
 
@@ -243,8 +308,9 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
 
 - V2.1 (implementado): hashing perceptual de imágenes y agrupación por
   similitud visual.
-- V2.2+: hashing perceptual de video (extracción de frames), detección
-  facial, embeddings, clustering de personas.
+- V2.2 (implementado): muestreo efímero de frames de video (`sample-frames`,
+  tabla `video_frame_samples`); sin detección facial todavía.
+- V2.3+: detección facial, embeddings, clustering de personas.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.
