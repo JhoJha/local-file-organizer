@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS files (
     perceptual_hash TEXT,
     similarity_method TEXT,
 
+    capture_date TEXT,
+    device_make TEXT,
+    device_model TEXT,
+    device_software TEXT,
+    gps_latitude REAL,
+    gps_longitude REAL,
+    gps_altitude REAL,
+    orientation INTEGER,
+
     scan_status TEXT,
     scan_error TEXT,
 
@@ -85,6 +94,27 @@ CREATE TABLE IF NOT EXISTS person_cluster_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_person_cluster_observations_label ON person_cluster_observations(person_label);
 CREATE INDEX IF NOT EXISTS idx_person_cluster_observations_path ON person_cluster_observations(file_path);
+CREATE TABLE IF NOT EXISTS persons (
+    person_id TEXT PRIMARY KEY,
+    display_name TEXT,
+    created_at TEXT NOT NULL,
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS person_aliases (
+    machine_label TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'manual',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_person_aliases_person ON person_aliases(person_id);
+CREATE TABLE IF NOT EXISTS file_person_links (
+    file_path TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (file_path, person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_person_links_person ON file_person_links(person_id);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -97,6 +127,15 @@ _ADDED_COLUMNS: dict[str, str] = {
     "similar_group": "TEXT",
     "perceptual_hash": "TEXT",
     "similarity_method": "TEXT",
+    # V3.0: EXIF/XMP enrichment via ExifTool (NULL = unknown, never a guess).
+    "capture_date": "TEXT",
+    "device_make": "TEXT",
+    "device_model": "TEXT",
+    "device_software": "TEXT",
+    "gps_latitude": "REAL",
+    "gps_longitude": "REAL",
+    "gps_altitude": "REAL",
+    "orientation": "INTEGER",
 }
 
 _FILE_COLUMNS = [
@@ -105,6 +144,8 @@ _FILE_COLUMNS = [
     "duration_seconds", "width", "height", "fps", "video_codec",
     "audio_codec", "bitrate",
     "perceptual_hash", "similarity_method",
+    "capture_date", "device_make", "device_model", "device_software",
+    "gps_latitude", "gps_longitude", "gps_altitude", "orientation",
     "scan_status", "scan_error",
     "metadata_status", "metadata_error",
 ]
@@ -154,6 +195,18 @@ class FileRecord:
 
     perceptual_hash: Optional[str] = None
     similarity_method: Optional[str] = None
+
+    # V3.0 EXIF/XMP enrichment (ExifTool). NULL/None always means
+    # "unknown" (stripped or never present) — the program never guesses a
+    # date, device or location.
+    capture_date: Optional[str] = None
+    device_make: Optional[str] = None
+    device_model: Optional[str] = None
+    device_software: Optional[str] = None
+    gps_latitude: Optional[float] = None
+    gps_longitude: Optional[float] = None
+    gps_altitude: Optional[float] = None
+    orientation: Optional[int] = None
 
     scan_status: str = "ok"
     scan_error: Optional[str] = None
@@ -334,6 +387,34 @@ def fetch_similar_files(conn: sqlite3.Connection, group_id: Optional[str] = None
 def fetch_perceptual_hash_count(conn: sqlite3.Connection) -> int:
     cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
     return cur.fetchone()[0]
+
+
+def fetch_exif_counts(conn: sqlite3.Connection, paths: Optional[list[str]] = None) -> dict[str, int]:
+    """Count files carrying EXIF/XMP enrichment: capture date, device
+    (make or model) and GPS coordinates. Always scoped to the current
+    scan when ``paths`` is given, like the other fetch helpers."""
+    scope = ""
+    params: list[str] = []
+    if paths is not None:
+        placeholders = ", ".join("?" for _ in paths)
+        scope = f" AND path IN ({placeholders})"
+        params = list(paths)
+    counts = {}
+    counts["with_capture_date"] = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE capture_date IS NOT NULL{scope}",
+        params,
+    ).fetchone()[0]
+    counts["with_device"] = conn.execute(
+        "SELECT COUNT(*) FROM files "
+        f"WHERE (device_make IS NOT NULL OR device_model IS NOT NULL){scope}",
+        params,
+    ).fetchone()[0]
+    counts["with_gps"] = conn.execute(
+        "SELECT COUNT(*) FROM files "
+        f"WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL{scope}",
+        params,
+    ).fetchone()[0]
+    return counts
 
 
 def clear_video_frame_samples(conn: sqlite3.Connection, file_path: str) -> None:
@@ -528,4 +609,114 @@ def fetch_person_cluster_observations(
             "ORDER BY person_label, file_path, timestamp_ms, bbox_x, id",
             (person_label,),
         )
+    return cur.fetchall()
+
+
+# --- V3.1 canonical identities -------------------------------------------
+# Machine cluster labels (P0001, ...) are model evidence; canonical persons
+# (PERSON_0007, ...) are human-curated identities. These helpers are plain
+# CRUD — the merge/split/resolve rules live in person_identity.py.
+
+def upsert_person(
+    conn: sqlite3.Connection,
+    person_id: str,
+    display_name: Optional[str] = None,
+    created_at: Optional[str] = None,
+    note: Optional[str] = None,
+) -> None:
+    """Create a canonical person, or update name/note if it already exists."""
+    conn.execute(
+        "INSERT INTO persons (person_id, display_name, created_at, note) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(person_id) DO UPDATE SET "
+        "display_name = excluded.display_name, note = excluded.note",
+        (person_id, display_name, created_at, note),
+    )
+
+
+def fetch_persons(conn: sqlite3.Connection) -> list:
+    cur = conn.execute("SELECT * FROM persons ORDER BY person_id")
+    return cur.fetchall()
+
+
+def fetch_person(conn: sqlite3.Connection, person_id: str):
+    cur = conn.execute("SELECT * FROM persons WHERE person_id = ?", (person_id,))
+    return cur.fetchone()
+
+
+def next_person_id(conn: sqlite3.Connection) -> str:
+    """Next free PERSON_NNNN id, scanning existing canonical ids only
+    (machine P000N labels live in a separate namespace and never clash)."""
+    taken = set()
+    for row in conn.execute("SELECT person_id FROM persons"):
+        label = row["person_id"] or ""
+        if label.startswith("PERSON_"):
+            try:
+                taken.add(int(label.split("_", 1)[1]))
+            except ValueError:
+                continue
+    number = 1
+    while number in taken:
+        number += 1
+    return f"PERSON_{number:04d}"
+
+
+def set_alias(
+    conn: sqlite3.Connection, machine_label: str, person_id: str, created_at: str
+) -> None:
+    """Point one machine cluster at a canonical person (merge = several
+    machine labels pointing at the same person_id)."""
+    conn.execute(
+        "INSERT INTO person_aliases (machine_label, person_id, origin, created_at) "
+        "VALUES (?, ?, 'manual', ?) "
+        "ON CONFLICT(machine_label) DO UPDATE SET person_id = excluded.person_id",
+        (machine_label, person_id, created_at),
+    )
+
+
+def fetch_aliases(conn: sqlite3.Connection) -> dict[str, str]:
+    """Map machine_label -> canonical person_id."""
+    return {
+        row["machine_label"]: row["person_id"]
+        for row in conn.execute("SELECT machine_label, person_id FROM person_aliases")
+    }
+
+
+def fetch_machine_labels(conn: sqlite3.Connection) -> set[str]:
+    """Distinct P000N labels currently in the cluster table ({} if the
+    table does not exist yet — same guard style as the other fetchers)."""
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT person_label FROM person_cluster_members"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {row["person_label"] for row in rows}
+
+
+def set_file_link(
+    conn: sqlite3.Connection, file_path: str, person_id: str, origin: str, created_at: str
+) -> None:
+    """Manual assertion about one file: origin 'manual' (user says this
+    file shows the person, even with no detected face) or 'excluded'
+    (user says an AUTO-derived membership is wrong for this file)."""
+    conn.execute(
+        "INSERT INTO file_person_links (file_path, person_id, origin, created_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(file_path, person_id) DO UPDATE SET origin = excluded.origin",
+        (file_path, person_id, origin, created_at),
+    )
+
+
+def delete_file_link(conn: sqlite3.Connection, file_path: str, person_id: str) -> None:
+    conn.execute(
+        "DELETE FROM file_person_links WHERE file_path = ? AND person_id = ?",
+        (file_path, person_id),
+    )
+
+
+def fetch_file_links(conn: sqlite3.Connection) -> list:
+    cur = conn.execute(
+        "SELECT * FROM file_person_links ORDER BY file_path, person_id"
+    )
     return cur.fetchall()

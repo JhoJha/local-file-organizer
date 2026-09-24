@@ -23,6 +23,10 @@ dependencies = [
 dev = [
     "pytest>=8",
     "ruff==0.9.10",
+    # Only for generating EXIF fixtures in tests (tests/test_exiftool.py);
+    # the application itself shells out to the ExifTool system binary and
+    # never imports piexif.
+    "piexif>=1.1",
 ]
 
 [tool.setuptools.packages.find]

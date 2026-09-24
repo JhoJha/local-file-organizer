@@ -13,6 +13,8 @@ CSV_COLUMNS = [
     "modified_at", "mime_type", "sha256", "duplicate_group", "similar_group",
     "duration_seconds", "width", "height", "fps", "video_codec",
     "audio_codec", "bitrate", "perceptual_hash", "similarity_method",
+    "capture_date", "device_make", "device_model", "device_software",
+    "gps_latitude", "gps_longitude", "gps_altitude", "orientation",
     "scan_status", "scan_error",
     "metadata_status", "metadata_error",
 ]
@@ -44,6 +46,9 @@ def build_summary_text(
     image_hash_count: int = 0,
     similar_group_count: int = 0,
     similar_grouped_file_count: int = 0,
+    exif_date_count: int = 0,
+    exif_device_count: int = 0,
+    exif_gps_count: int = 0,
 ) -> str:
     lines = ["=== RESUMEN ===", ""]
     for row in category_totals:
@@ -69,6 +74,12 @@ def build_summary_text(
     lines.append(f"{similar_group_count} grupos de similares detectados")
     lines.append(f"{similar_grouped_file_count} imágenes agrupadas")
     lines.append(f"{max(image_hash_count - similar_grouped_file_count, 0)} imágenes sin grupo (únicas)")
+
+    lines.append("")
+    lines.append("Metadata EXIF (ExifTool):")
+    lines.append(f"{exif_date_count} archivos con fecha de captura")
+    lines.append(f"{exif_device_count} archivos con dispositivo conocido")
+    lines.append(f"{exif_gps_count} archivos con GPS")
 
     lines.append("")
     lines.append("Errores:")

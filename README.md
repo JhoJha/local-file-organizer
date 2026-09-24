@@ -47,6 +47,14 @@ servicios en la nube ni usa IA generativa.
     conservador a `Revisión/` — ver
     [Vista previa de organización con confianza
     (V2.5.1)](#vista-previa-de-organización-con-confianza-v251).
+15. (V3.0) `scan` enriquece imágenes y videos con EXIF/XMP vía ExifTool
+    del sistema (fecha de captura, dispositivo, GPS, orientación) — ver
+    [Enriquecimiento EXIF (V3.0)](#enriquecimiento-exif-v30).
+16. (V3.1) `persons` / `person-merge` / `person-rename` / `person-assign` /
+    `person-unassign` / `person-split` curan identidades canónicas
+    (`PERSON_0007`, con nombre opcional) sobre los clusters del modelo
+    (`P0001`, …) — ver
+    [Identidades canónicas (V3.1)](#identidades-canónicas-v31).
 
 ## Qué NO hace (por diseño)
 
@@ -70,6 +78,10 @@ no reorganiza carpetas.
 - `ffmpeg`/`ffprobe` instalado en el sistema para metadata de video (si no
   está disponible, el escaneo continúa y solo se omite esa metadata,
   registrando el motivo por archivo).
+- `exiftool` (`libimage-exiftool-perl`) instalado en el sistema para el
+  enriquecimiento EXIF/XMP de V3.0 (fecha de captura, dispositivo, GPS,
+  orientación). Es opcional: si no está disponible, `scan` funciona igual
+  que en V2.5.1 y las columnas EXIF quedan en NULL (= desconocido).
 
 Instala las dependencias del proyecto (idealmente en un entorno virtual):
 
@@ -518,6 +530,55 @@ Opciones de `face-review`: `--db`, `--output-dir`, `--decisions`,
 defecto `192` px), `--verify-readonly`, `--snapshot-dir`, `--quiet`.
 `face-review-import` acepta `decisions_file`, `--db`, `--decisions` y
 `--quiet`.
+
+## Enriquecimiento EXIF (V3.0)
+
+Si el binario `exiftool` está en el `PATH`, `scan` extrae por cada imagen
+y video (tags QuickTime incluidos): fecha de captura (`DateTimeOriginal`,
+con fallback `CreateDate`/`MediaCreateDate`/`TrackCreateDate`/
+`CreationDate`), fabricante/modelo/software, GPS decimal y orientación.
+Se guarda en las columnas `capture_date`, `device_make`,
+`device_model`, `device_software`, `gps_latitude`, `gps_longitude`,
+`gps_altitude`, `orientation` (migración automática en catálogos
+anteriores) y aparece en el CSV y en el bloque `Metadata EXIF` del
+resumen.
+
+Reglas: EXIF es enriquecimiento, nunca veredicto — un archivo sin tags
+(WhatsApp/Telegram/recompresión) queda en NULL (= desconocido) con
+`metadata_status` intacto, nunca se inventa nada; fechas `0000:00:00`
+y coordenadas fuera de rango se descartan; cualquier fallo del binario
+se captura sin abortar el escaneo; sin `exiftool`, `scan` funciona igual
+que en V2.5.1. Limitación conocida: un subproceso por archivo
+(~0.2-0.5 s); a decenas de miles de archivos pedirá modo batch
+(`-stay_open`, trabajo futuro).
+
+## Identidades canónicas (V3.1)
+
+Un cluster facial (`P0001`, …) es solo evidencia del modelo: puede
+dividir a una persona real en varios clusters. La identidad canónica
+(`PERSON_0007` + nombre opcional, p. ej. `María`) es lo que el usuario
+cura, filtra y organiza. Tablas nuevas en el catálogo (auto-creadas en
+bases anteriores): `persons`, `person_aliases` (cluster → canónica) y
+`file_person_links` (`manual`/`excluded` por archivo).
+
+```bash
+python -m local_file_organizer persons
+python -m local_file_organizer person-merge P0001 P0002 --name María
+python -m local_file_organizer person-rename P0003 --name Pedro
+python -m local_file_organizer person-assign /ruta/video.mp4 PERSON_0007
+python -m local_file_organizer person-unassign /ruta/foto.jpg PERSON_0007
+python -m local_file_organizer person-split P0001 --files /ruta/a.jpg --name Otro
+```
+
+Reglas: sin curación todo resuelve igual que en V2.5 (`P0001` → `P0001`);
+`assign` funciona aunque nunca se detectó una cara (el caso del video
+de §6 del diseño); `unassign` sobre membresía AUTO deja una exclusión
+explícita sin tocar el resto del cluster; `split` es a nivel archivo;
+las decisiones de `face-review` sobre miembros se heredan de forma
+conservadora (`rejected`/`uncertain` ganan a `confirmed`);
+`organize-preview` ya enruta por canónicas (`Media/Personas/PERSON_0007/`)
+y manda la evidencia débil a `Revisión/`. No hay auto-merge: solo estos
+comandos explícitos fusionan.
 
 ## Modelo de errores por archivo
 

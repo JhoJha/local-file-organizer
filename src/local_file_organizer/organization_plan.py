@@ -23,6 +23,11 @@ from .face_review import (
     DECISION_REJECTED,
     DECISION_UNCERTAIN,
 )
+from .person_identity import (
+    combined_review_status,
+    member_machine_labels,
+    resolve_file_persons,
+)
 
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_MEDIUM = "medium"
@@ -72,35 +77,88 @@ def _fetch_person_sets(conn: sqlite3.Connection) -> dict[str, set[str]]:
 
 
 def person_evidence(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Aggregate countable evidence per ``person_label`` from cluster members.
+    """Aggregate countable evidence per effective person.
 
-    Returns ``{label: {"files", "images", "videos", "observations",
-    "cross_media"}}`` where ``files`` is ``COUNT(DISTINCT file_path)``,
-    ``images``/``videos`` count member files by ``file_category``,
-    ``observations`` is ``SUM(observation_count)`` and ``cross_media`` is
-    true only when both images and videos appear. Nothing is persisted.
+    Machine cluster rows are grouped by canonical identity (aliases), so
+    merged clusters pool their evidence; manually assigned files count
+    toward ``files``/``images``/``videos`` (human-verified) but never
+    toward ``observations`` (no embedding behind them). With zero
+    curation the output is identical to the pre-V3.1 machine-level
+    version. Nothing is persisted.
     """
     evidence: dict[str, dict] = {}
     try:
         rows = conn.execute(
-            "SELECT person_label, "
-            "COUNT(DISTINCT file_path) AS files, "
-            "SUM(CASE WHEN file_category = 'image' THEN 1 ELSE 0 END) AS images, "
-            "SUM(CASE WHEN file_category = 'video' THEN 1 ELSE 0 END) AS videos, "
-            "SUM(observation_count) AS observations "
-            "FROM person_cluster_members "
-            "GROUP BY person_label"
+            "SELECT person_label, file_path, file_category, observation_count "
+            "FROM person_cluster_members"
         ).fetchall()
     except sqlite3.OperationalError:
         return evidence
+    try:
+        aliases = {
+            row["machine_label"]: row["person_id"]
+            for row in conn.execute(
+                "SELECT machine_label, person_id FROM person_aliases"
+            )
+        }
+    except sqlite3.OperationalError:
+        aliases = {}
+    try:
+        catalog_category = {
+            row["path"]: row["category"]
+            for row in conn.execute("SELECT path, category FROM files")
+        }
+    except sqlite3.OperationalError:
+        catalog_category = {}
+    manual_files: dict[str, set[str]] = {}
+    try:
+        for row in conn.execute(
+            "SELECT file_path, person_id FROM file_person_links "
+            "WHERE origin = 'manual'"
+        ):
+            manual_files.setdefault(row["person_id"], set()).add(row["file_path"])
+    except sqlite3.OperationalError:
+        pass
+
+    grouped: dict[str, dict] = {}
     for row in rows:
-        images = row["images"] or 0
-        videos = row["videos"] or 0
-        evidence[row["person_label"]] = {
-            "files": row["files"] or 0,
+        canonical = aliases.get(row["person_label"], row["person_label"])
+        entry = grouped.setdefault(
+            canonical,
+            {"files": set(), "images": 0, "videos": 0, "observations": 0},
+        )
+        path = row["file_path"]
+        if path not in entry["files"]:
+            entry["files"].add(path)
+            # file_category mirrors the catalog category for clustered
+            # files; fall back to the catalog when they disagree.
+            category = catalog_category.get(path, row["file_category"])
+            if category == "image":
+                entry["images"] += 1
+            elif category == "video":
+                entry["videos"] += 1
+        entry["observations"] += row["observation_count"] or 0
+    for person_id, paths in manual_files.items():
+        entry = grouped.setdefault(
+            person_id, {"files": set(), "images": 0, "videos": 0, "observations": 0}
+        )
+        for path in paths:
+            if path in entry["files"]:
+                continue
+            entry["files"].add(path)
+            category = catalog_category.get(path)
+            if category == "image":
+                entry["images"] += 1
+            elif category == "video":
+                entry["videos"] += 1
+    for person_id, entry in grouped.items():
+        images = entry["images"]
+        videos = entry["videos"]
+        evidence[person_id] = {
+            "files": len(entry["files"]),
             "images": images,
             "videos": videos,
-            "observations": row["observations"] or 0,
+            "observations": entry["observations"],
             "cross_media": images > 0 and videos > 0,
         }
     return evidence
@@ -152,7 +210,7 @@ def build_organization_plan(
     paths = [row["path"] for row in rows]
     file_ids = {path: f"F{i + 1:06d}" for i, path in enumerate(paths)}
 
-    person_sets = _fetch_person_sets(conn)
+    person_sets = resolve_file_persons(conn)
     evidence = person_evidence(conn)
 
     # First pass: base buckets + person-sets for person-routable media.
@@ -188,7 +246,12 @@ def build_organization_plan(
     group_labels = {t: f"GROUP_{i + 1:04d}" for i, t in enumerate(group_tuples)}
 
     def _status_for(label: str) -> str | None:
-        return decisions.get(label)
+        # V2.4.1 decisions are keyed by machine cluster; a canonical
+        # person inherits its members' decisions conservatively
+        # (rejected/uncertain win over confirmed).
+        return combined_review_status(
+            decisions, label, member_machine_labels(conn, label)
+        )
 
     def _level_for(label: str) -> str:
         return person_confidence(

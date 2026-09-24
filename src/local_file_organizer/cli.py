@@ -18,6 +18,7 @@ from typing import Optional
 import cv2
 
 from . import database
+from . import person_identity
 from .classifier import classify
 from .face_clustering import assign_person_labels, cluster_people
 from .face_clustering import (
@@ -30,6 +31,7 @@ from .face_detection import (
     detect_faces_in_image_file,
     detect_faces_raw,
 )
+from .exiftool import exiftool_available, get_exif_metadata
 from .face_embedding import compute_embedding
 from .face_review import (
     DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
@@ -77,7 +79,7 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
-def _scan_one_file(path: Path) -> database.FileRecord:
+def _scan_one_file(path: Path, enable_exif: bool = True) -> database.FileRecord:
     try:
         basic = get_basic_metadata(path)
     except OSError as exc:
@@ -128,6 +130,21 @@ def _scan_one_file(path: Path) -> database.FileRecord:
     # Other categories have no specialized extraction yet in V1, so
     # metadata_status keeps its "skipped" default.
 
+    # V3.0 EXIF/XMP enrichment for stills and video (QuickTime tags).
+    # Pure enrichment: it only fills columns, it never flips
+    # metadata_status — a file without EXIF is "unknown", not an error.
+    if enable_exif and basic.category in ("image", "video"):
+        exif = get_exif_metadata(path)
+        if exif.error is None:
+            record.capture_date = exif.capture_date
+            record.device_make = exif.device_make
+            record.device_model = exif.device_model
+            record.device_software = exif.device_software
+            record.gps_latitude = exif.gps_latitude
+            record.gps_longitude = exif.gps_longitude
+            record.gps_altitude = exif.gps_altitude
+            record.orientation = exif.orientation
+
     return record
 
 
@@ -174,9 +191,13 @@ def run_scan(
     duplicate_candidates: list[DuplicateRecord] = []
     image_hash_candidates: list[SimilarityRecord] = []
 
+    # One PATH lookup for the whole run instead of one per file; when
+    # ExifTool is absent the scan behaves exactly like V2.5.1.
+    exif_enabled = exiftool_available()
+
     count = 0
     for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
-        record = _scan_one_file(file_path)
+        record = _scan_one_file(file_path, enable_exif=exif_enabled)
         record.duplicate_group = None
         record.similar_group = None
         database.upsert_file(conn, record)
@@ -250,6 +271,7 @@ def run_scan(
     total_files = len(scanned_paths)
     total_bytes = sum(row["total_bytes"] or 0 for row in category_totals)
     error_count = database.fetch_error_count(conn, paths=scanned_paths)
+    exif_counts = database.fetch_exif_counts(conn, paths=scanned_paths)
 
     summary = build_summary_text(
         category_totals=category_totals,
@@ -262,6 +284,9 @@ def run_scan(
         image_hash_count=len(image_hash_candidates),
         similar_group_count=sim_stats.total_groups,
         similar_grouped_file_count=sim_stats.total_grouped_files,
+        exif_date_count=exif_counts["with_capture_date"],
+        exif_device_count=exif_counts["with_device"],
+        exif_gps_count=exif_counts["with_gps"],
     )
     print()
     print(summary)
@@ -908,6 +933,126 @@ def run_cluster_people(
     conn.close()
 
 
+def _require_catalog(conn, db_path: Path) -> None:
+    """Exit(1) unless the catalog exists and holds at least one file row."""
+    try:
+        count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+    except Exception:
+        count_row = None
+    if not count_row or not count_row[0]:
+        conn.close()
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def run_persons(db_path: Path = DEFAULT_DB_PATH) -> None:
+    """List effective persons (canonical + unmapped machine clusters)."""
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    _require_catalog(conn, db_path)
+    summary = person_identity.effective_summary(conn)
+    conn.close()
+    conn.close()
+    print()
+    print("=== PERSONS ===")
+    for entry in summary:
+        name = f" name={entry['display_name']!r}" if entry["display_name"] else ""
+        members = ",".join(entry["machine_labels"])
+        print(
+            f"{entry['person_id']} files={entry['files']} "
+            f"images={entry['images']} videos={entry['videos']}"
+            f"{name} clusters=[{members}]"
+        )
+    print(f"persons={len(summary)}")
+
+
+def _run_person_mutation(db_path: Path, action) -> str:
+    """Open the catalog, apply an identity ``action(conn) -> person_id``
+    atomically, and return the resulting canonical id."""
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    _require_catalog(conn, db_path)
+    try:
+        person_id = action(conn)
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    conn.commit()
+    conn.close()
+    return person_id
+
+
+def run_person_merge(
+    refs: list[str],
+    db_path: Path = DEFAULT_DB_PATH,
+    name: Optional[str] = None,
+) -> None:
+    person_id = _run_person_mutation(
+        db_path, lambda conn: person_identity.merge_labels(conn, refs, name)
+    )
+    print(f"merged -> {person_id}")
+
+
+def run_person_rename(
+    ref: str,
+    db_path: Path = DEFAULT_DB_PATH,
+    name: str = "",
+) -> None:
+    person_id = _run_person_mutation(
+        db_path, lambda conn: person_identity.rename_person(conn, ref, name)
+    )
+    print(f"renamed -> {person_id}")
+
+
+def run_person_assign(
+    file_path: str,
+    ref: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    person_id = _run_person_mutation(
+        db_path, lambda conn: person_identity.assign_file(conn, file_path, ref)
+    )
+    print(f"linked {file_path} -> {person_id}")
+
+
+def run_person_unassign(
+    file_path: str,
+    ref: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    person_id = _run_person_mutation(
+        db_path, lambda conn: person_identity.unassign_file(conn, file_path, ref)
+    )
+    print(f"unlinked {file_path} -/-> {person_id}")
+
+
+def run_person_split(
+    machine_label: str,
+    file_paths: list[str],
+    db_path: Path = DEFAULT_DB_PATH,
+    name: Optional[str] = None,
+) -> None:
+    person_id = _run_person_mutation(
+        db_path,
+        lambda conn: person_identity.split_files(conn, machine_label, file_paths, name),
+    )
+    print(f"split -> {person_id} files={len(file_paths)}")
+
+
 def run_organize_preview(
     db_path: Path = DEFAULT_DB_PATH,
     plan_path: Path = DEFAULT_PLAN_PATH,
@@ -1406,6 +1551,7 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
     image_hash_count = database.fetch_perceptual_hash_count(conn)
     sim_groups = database.fetch_similar_groups(conn)
     similar_grouped_file_count = sum(row["count"] for row in sim_groups)
+    exif_counts = database.fetch_exif_counts(conn)
 
     summary = build_summary_text(
         category_totals=category_totals,
@@ -1418,6 +1564,9 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
         image_hash_count=image_hash_count,
         similar_group_count=len(sim_groups),
         similar_grouped_file_count=similar_grouped_file_count,
+        exif_date_count=exif_counts["with_capture_date"],
+        exif_device_count=exif_counts["with_device"],
+        exif_gps_count=exif_counts["with_gps"],
     )
     print(summary)
     conn.close()
@@ -1648,6 +1797,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_import_parser.add_argument("--quiet", action="store_true")
 
+    persons_parser = subparsers.add_parser(
+        "persons",
+        help="Listar personas efectivas (canónicas + clusters sin fusionar).",
+    )
+    persons_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    merge_parser = subparsers.add_parser(
+        "person-merge",
+        help="Fusionar 2+ clusters/personas en una identidad canónica.",
+    )
+    merge_parser.add_argument(
+        "refs", nargs="+", help="Etiquetas P000N o PERSON_0007 a fusionar."
+    )
+    merge_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    merge_parser.add_argument("--name", default=None, help="Nombre para mostrar.")
+
+    rename_parser = subparsers.add_parser(
+        "person-rename",
+        help="Nombrar una persona (un P000N estrena identidad canónica).",
+    )
+    rename_parser.add_argument("ref", help="Etiqueta P000N o PERSON_0007.")
+    rename_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    rename_parser.add_argument("--name", required=True, help="Nombre para mostrar.")
+
+    assign_parser = subparsers.add_parser(
+        "person-assign",
+        help="Afirmar manualmente que un archivo muestra a una persona.",
+    )
+    assign_parser.add_argument("file_path", help="Ruta tal como está en el catálogo.")
+    assign_parser.add_argument("ref", help="Etiqueta P000N o PERSON_0007.")
+    assign_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    unassign_parser = subparsers.add_parser(
+        "person-unassign",
+        help="Quitar el vínculo persona-archivo (exclusión si era AUTO).",
+    )
+    unassign_parser.add_argument("file_path", help="Ruta tal como está en el catálogo.")
+    unassign_parser.add_argument("ref", help="Etiqueta P000N o PERSON_0007.")
+    unassign_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    split_parser = subparsers.add_parser(
+        "person-split",
+        help="Separar archivos de un cluster a una persona nueva.",
+    )
+    split_parser.add_argument("machine_label", help="Cluster P000N origen.")
+    split_parser.add_argument(
+        "--files", nargs="+", required=True, help="Rutas del catálogo a separar."
+    )
+    split_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    split_parser.add_argument("--name", default=None, help="Nombre para mostrar.")
+
     return parser
 
 
@@ -1735,6 +1935,23 @@ def main(argv: Optional[list[str]] = None) -> None:
             db_path=args.db,
             decisions_path=args.decisions,
             quiet=args.quiet,
+        )
+    elif args.command == "persons":
+        run_persons(db_path=args.db)
+    elif args.command == "person-merge":
+        run_person_merge(refs=args.refs, db_path=args.db, name=args.name)
+    elif args.command == "person-rename":
+        run_person_rename(ref=args.ref, db_path=args.db, name=args.name)
+    elif args.command == "person-assign":
+        run_person_assign(file_path=args.file_path, ref=args.ref, db_path=args.db)
+    elif args.command == "person-unassign":
+        run_person_unassign(file_path=args.file_path, ref=args.ref, db_path=args.db)
+    elif args.command == "person-split":
+        run_person_split(
+            machine_label=args.machine_label,
+            file_paths=args.files,
+            db_path=args.db,
+            name=args.name,
         )
 
 
