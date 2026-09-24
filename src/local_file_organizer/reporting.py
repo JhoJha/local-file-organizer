@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 from .metadata import human_readable_size
 
@@ -15,6 +16,7 @@ CSV_COLUMNS = [
     "audio_codec", "bitrate", "perceptual_hash", "similarity_method",
     "capture_date", "device_make", "device_model", "device_software",
     "gps_latitude", "gps_longitude", "gps_altitude", "orientation",
+    "last_seen_at", "file_state", "extractor_versions",
     "scan_status", "scan_error",
     "metadata_status", "metadata_error",
 ]
@@ -49,6 +51,10 @@ def build_summary_text(
     exif_date_count: int = 0,
     exif_device_count: int = 0,
     exif_gps_count: int = 0,
+    reused_count: Optional[int] = None,
+    added_count: Optional[int] = None,
+    reprocessed_count: Optional[int] = None,
+    stale_count: Optional[int] = None,
 ) -> str:
     lines = ["=== RESUMEN ===", ""]
     for row in category_totals:
@@ -80,6 +86,14 @@ def build_summary_text(
     lines.append(f"{exif_date_count} archivos con fecha de captura")
     lines.append(f"{exif_device_count} archivos con dispositivo conocido")
     lines.append(f"{exif_gps_count} archivos con GPS")
+
+    if reused_count is not None:
+        lines.append("")
+        lines.append("Incremental:")
+        lines.append(f"{reused_count} reutilizados sin re-analizar")
+        lines.append(f"{added_count} nuevos")
+        lines.append(f"{reprocessed_count} reprocesados")
+        lines.append(f"{stale_count} marcados stale (ya no existen)")
 
     lines.append("")
     lines.append("Errores:")

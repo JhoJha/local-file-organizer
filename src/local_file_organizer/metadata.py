@@ -14,11 +14,16 @@ from pathlib import Path
 from typing import Optional
 
 from .classifier import classify
+from .scanner import is_regular_file
 
 _SIZE_UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 
 FFPROBE_BINARY = "ffprobe"
 FFPROBE_TIMEOUT_SECONDS = 30
+
+# Incrementality contract (V3.2/F1): stored per file in
+# files.extractor_versions; bump to force video re-probing.
+FFPROBE_VERSION = "ffprobe_v1"
 
 
 def human_readable_size(num_bytes: int) -> str:
@@ -114,6 +119,9 @@ def get_video_metadata(path: Path) -> VideoMetadata:
     """
     if not ffprobe_available():
         return VideoMetadata(error="ffprobe not found on PATH")
+
+    if not is_regular_file(path):
+        return VideoMetadata(error="not a regular file: skipped (FIFO/socket/device?)")
 
     command = [
         FFPROBE_BINARY,

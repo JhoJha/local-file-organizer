@@ -33,8 +33,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .scanner import is_regular_file
+
 EXIFTOOL_BINARY = "exiftool"
 EXIFTOOL_TIMEOUT_SECONDS = 30
+
+# Incrementality contract (V3.2/F1): stored per file in
+# files.extractor_versions; bump to force EXIF re-extraction.
+EXIFTOOL_VERSION = "exiftool_v1"
 
 # Capture-date candidates, in priority order. Different containers store
 # the capture moment under different tags: stills use DateTimeOriginal,
@@ -163,6 +169,9 @@ def get_exif_metadata(path: Path) -> ExifMetadata:
     """
     if not exiftool_available():
         return ExifMetadata(error="exiftool not found on PATH")
+
+    if not is_regular_file(path):
+        return ExifMetadata(error="not a regular file: skipped (FIFO/socket/device?)")
 
     command = [EXIFTOOL_BINARY, "-j", "-n", "-s", str(path)]
     try:

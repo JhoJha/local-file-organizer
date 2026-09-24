@@ -204,7 +204,8 @@ def build_organization_plan(
     decisions = decisions or {}
     rows = conn.execute(
         "SELECT path, extension, category, scan_status, metadata_status,"
-        " duplicate_group, similar_group FROM files ORDER BY path ASC"
+        " duplicate_group, similar_group FROM files "
+        "WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
     ).fetchall()
 
     paths = [row["path"] for row in rows]

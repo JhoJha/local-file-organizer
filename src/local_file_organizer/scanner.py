@@ -6,6 +6,7 @@ deletes anything inside the scanned tree.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -30,6 +31,22 @@ DEFAULT_IGNORED_DIRS: frozenset[str] = frozenset(
 class ScanError:
     path: str
     message: str
+
+
+def is_regular_file(path: Path) -> bool:
+    """True only for regular files (symlinks are followed, like stat).
+
+    FIFOs, sockets, devices and anything un-stat-able return False.
+    Content readers (hashing, image decoding, ffprobe/exiftool spawns)
+    must check this first: opening a FIFO for reading blocks forever,
+    and no timeout can interrupt a blocked read — a single FIFO in the
+    tree used to hang the whole scan. The inventory itself (stat-only)
+    still records such entries.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
 
 
 def iter_files(

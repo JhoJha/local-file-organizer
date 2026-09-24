@@ -23,8 +23,15 @@ from typing import Iterable, Optional
 
 from PIL import Image
 
+from .scanner import is_regular_file
+
 SIMILARITY_METHOD = "dhash8x8"
 _HASH_SIZE = 8  # 8x8 -> 64-bit hash, from a resized (hash_size+1) x hash_size image
+
+# Incrementality contract (V3.2/F1): this version string is stored per
+# file in files.extractor_versions. Bump it if the algorithm changes so
+# the next scan reprocesses images instead of trusting stale hashes.
+DHASH_VERSION = "dhash_v1"
 
 # Hamming distance threshold (out of 64 bits) below which two images are
 # considered "similar enough" to group. Chosen conservatively: dHash
@@ -81,6 +88,8 @@ def get_image_metadata(path: Path) -> ImageHashResult:
     is captured in ``ImageHashResult.error`` instead of propagating, so a
     single bad image never aborts the overall scan.
     """
+    if not is_regular_file(path):
+        return ImageHashResult(error="not a regular file: skipped (FIFO/socket/device?)")
     try:
         digest = compute_dhash(path)
     except Exception as exc:  # Pillow raises many distinct types for bad image data.

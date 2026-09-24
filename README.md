@@ -55,6 +55,14 @@ servicios en la nube ni usa IA generativa.
     (`PERSON_0007`, con nombre opcional) sobre los clusters del modelo
     (`P0001`, …) — ver
     [Identidades canónicas (V3.1)](#identidades-canónicas-v31).
+17. (V3.2) `search` filtra el catálogo por condiciones estructuradas
+    (categoría, persona, dispositivo, año, duración, tamaño, GPS,
+    duplicados) con IDs estables `F000NNN` — ver
+    [Búsqueda estructurada (V3.2)](#búsqueda-estructurada-v32).
+18. (F1) `scan` es incremental: reutiliza archivos intactos
+    (fingerprint tamaño+mtime+versiones de extractor), marca `stale` lo
+    desaparecido y acepta `--full` para re-analizar todo — ver
+    [Scan incremental (F1)](#scan-incremental-f1).
 
 ## Qué NO hace (por diseño)
 
@@ -104,6 +112,9 @@ python -m local_file_organizer cluster-people /ruta/a/analizar
 python -m local_file_organizer face-review /ruta/a/analizar
 python -m local_file_organizer face-review-import review_decisions.json
 python -m local_file_organizer organize-preview
+python -m local_file_organizer persons
+python -m local_file_organizer person-merge P0001 P0002 --name María
+python -m local_file_organizer search --category video --person PERSON_0001 --min-duration 600
 ```
 
 Opciones de `scan`:
@@ -120,6 +131,9 @@ Opciones de `scan`:
 - `--similarity-threshold N` — distancia Hamming máxima (0-64) para
   agrupar dos imágenes como visualmente similares (por defecto `8`; ver
   [Similitud visual de imágenes (V2.1)](#similitud-visual-de-imágenes-v21)).
+- `--full` — re-analizar todos los archivos aunque su fingerprint no
+  haya cambiado (por defecto el scan es incremental; ver
+  [Scan incremental (F1)](#scan-incremental-f1)).
 
 `similar-images` acepta `--db RUTA` y lista los grupos ya calculados por el
 último `scan` (no vuelve a leer las imágenes).
@@ -579,6 +593,61 @@ conservadora (`rejected`/`uncertain` ganan a `confirmed`);
 `organize-preview` ya enruta por canónicas (`Media/Personas/PERSON_0007/`)
 y manda la evidencia débil a `Revisión/`. No hay auto-merge: solo estos
 comandos explícitos fusionan.
+
+## Búsqueda estructurada (V3.2)
+
+`search` responde filtros AND sobre el catálogo existente, sin tocar el
+árbol escaneado:
+
+```bash
+python -m local_file_organizer search --category video --person PERSON_0001 --min-duration 600
+python -m local_file_organizer search --device "POCO X6" --year 2025 --category video --min-size 500MB
+python -m local_file_organizer search --has-gps --bbox "35,45,-10,5" --sort size_bytes --desc --limit 20
+```
+
+Filtros: `--category`/`--extension` (coma = OR), `--person` (repetible,
+todas deben aparecer; `P000N` = cluster crudo, `PERSON_0007`/nombre =
+identidad efectiva), `--device` (marca o modelo exacto),
+`--year`, `--min/max-duration`, `--min/max-size` (`500MB`, `1.5G`),
+`--has-gps`/`--has-device`/`--has-date`, `--bbox`, `--duplicates`,
+`--similar`. Todo flag acota (AND); valores siempre parametrizados
+(una inyección solo devuelve 0 filas).
+
+La salida usa los mismos IDs `F000NNN` que `organization_plan.json`
+(numerados por `path` sobre todo el catálogo) e IDs nunca rutas:
+`--show-files` es solo para ejecución manual. El lenguaje de filtros es
+un dict versionado (`query.cli_filters` → `query.run_query`) pensado
+para reutilizarse tal cual en colecciones inteligentes (V3.3) y reglas
+(V3.4). Índices sobre los campos de filtro se crean solos al abrir el
+catálogo. Sin full-text todavía: necesita extracción de texto
+documental (Tika/OCR), pendiente explícito.
+
+## Scan incremental (F1)
+
+Re-escanear no re-analiza: cada archivo se identifica por
+`(tamaño, mtime)` más las versiones de los extractores que lo
+produjeron (`dhash_v1`, `ffprobe_v1`, `exiftool_v1`, en
+`files.extractor_versions`). Si nada cambió, el archivo solo actualiza
+`last_seen_at` — sin decodificar, sin subprocesos, sin leer bytes
+(SHA-256 y hash perceptual se reutilizan del catálogo). En el piloto de
+380 archivos el re-scan bajó de ~40 s a ~0.3 s (~140×).
+
+```bash
+python -m local_file_organizer scan /ruta/a/analizar        # incremental
+python -m local_file_organizer scan /ruta/a/analizar --full # re-analizar todo
+```
+
+Reglas: lo nuevo/cambiado se procesa normal; lo desaparecido pasa a
+`file_state='stale'` (se conserva para auditoría, sale de grupos y de
+todas las vistas: `summary`, `search`, `organize-preview`,
+`similar-images`); un extractor fallido no deja versión y se reintenta
+el próximo scan; un binario recién instalado (p. ej. exiftool)
+reprocesa lo pendiente automáticamente. Limitación conocida: mismo
+tamaño + mtime congelado con contenido distinto no se detecta (se
+prefiere no hashear 800 GB en cada scan; `--full` lo cubre).
+Robustez: FIFOs, sockets y otros no-regulares se inventarían pero
+nunca se abren para leer (abrir un FIFO bloquea para siempre sin
+timeout posible); quedan registrados con el motivo en `scan_error`.
 
 ## Modelo de errores por archivo
 

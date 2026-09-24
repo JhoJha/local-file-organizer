@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +32,7 @@ from .face_detection import (
     detect_faces_in_image_file,
     detect_faces_raw,
 )
-from .exiftool import exiftool_available, get_exif_metadata
+from .exiftool import EXIFTOOL_VERSION, exiftool_available, get_exif_metadata
 from .face_embedding import compute_embedding
 from .face_review import (
     DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
@@ -46,10 +47,16 @@ from .face_review import (
     write_review_site,
 )
 from .hashing import DuplicateRecord, find_duplicates
-from .metadata import get_basic_metadata, get_video_metadata, human_readable_size
+from .metadata import (
+    FFPROBE_VERSION,
+    get_basic_metadata,
+    get_video_metadata,
+    human_readable_size,
+)
 from .video_sampling import compute_sample_timestamps, sample_video_frames
 from .perceptual_hash import (
     DEFAULT_SIMILARITY_THRESHOLD,
+    DHASH_VERSION,
     SimilarityRecord,
     get_image_metadata,
     group_similar_images,
@@ -79,18 +86,56 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
-def _scan_one_file(path: Path, enable_exif: bool = True) -> database.FileRecord:
-    try:
-        basic = get_basic_metadata(path)
-    except OSError as exc:
-        return database.FileRecord(
-            path=str(path),
-            name=path.name,
-            extension=path.suffix.lower(),
-            category=classify(path.suffix),
-            scan_status="error",
-            scan_error=str(exc),
-        )
+def _required_versions(category: str, exif_enabled: bool) -> set[str]:
+    """Extractor versions a scan would run for this category (F1).
+
+    'other' needs nothing beyond stat+classify, so a fingerprinted
+    'other' file always skips. Versions are only recorded on success
+    (see _scan_one_file), so failed extractions are retried next scan.
+    """
+    required: set[str] = set()
+    if category == "image":
+        required.add(DHASH_VERSION)
+    elif category == "video":
+        required.add(FFPROBE_VERSION)
+    if exif_enabled and category in ("image", "video"):
+        required.add(EXIFTOOL_VERSION)
+    return required
+
+
+def _fingerprint_match(
+    stored: Optional[dict], basic, exif_enabled: bool
+) -> bool:
+    """True when the catalog row is fresh: same bytes (size+mtime) and
+    the stored extractor versions cover everything this scan would run.
+    """
+    if not stored:
+        return False
+    if stored.get("size_bytes") != basic.size_bytes:
+        return False
+    if stored.get("modified_at") != basic.modified_at:
+        return False
+    stored_versions = set((stored.get("extractor_versions") or "").split("|")) - {""}
+    return _required_versions(basic.category, exif_enabled) <= stored_versions
+
+
+def _scan_one_file(
+    path: Path, enable_exif: bool = True, known_basic=None
+) -> database.FileRecord:
+    if known_basic is None:
+        try:
+            basic = get_basic_metadata(path)
+        except OSError as exc:
+            return database.FileRecord(
+                path=str(path),
+                name=path.name,
+                extension=path.suffix.lower(),
+                category=classify(path.suffix),
+                scan_status="error",
+                scan_error=str(exc),
+            )
+    else:
+        basic = known_basic
 
     record = database.FileRecord(
         path=basic.path,
@@ -133,9 +178,11 @@ def _scan_one_file(path: Path, enable_exif: bool = True) -> database.FileRecord:
     # V3.0 EXIF/XMP enrichment for stills and video (QuickTime tags).
     # Pure enrichment: it only fills columns, it never flips
     # metadata_status — a file without EXIF is "unknown", not an error.
+    exif_ok = False
     if enable_exif and basic.category in ("image", "video"):
         exif = get_exif_metadata(path)
         if exif.error is None:
+            exif_ok = True
             record.capture_date = exif.capture_date
             record.device_make = exif.device_make
             record.device_model = exif.device_model
@@ -144,6 +191,19 @@ def _scan_one_file(path: Path, enable_exif: bool = True) -> database.FileRecord:
             record.gps_longitude = exif.gps_longitude
             record.gps_altitude = exif.gps_altitude
             record.orientation = exif.orientation
+
+    # F1 incrementality: record which extractors succeeded. Failed ones
+    # are omitted so the next scan retries them; a newly appeared binary
+    # (e.g. exiftool installed later) triggers reprocessing via the
+    # required-vs-stored subset check in _fingerprint_match.
+    versions: set[str] = set()
+    if basic.category == "image" and record.metadata_status == "ok":
+        versions.add(DHASH_VERSION)
+    if basic.category == "video" and record.metadata_status == "ok":
+        versions.add(FFPROBE_VERSION)
+    if exif_ok:
+        versions.add(EXIFTOOL_VERSION)
+    record.extractor_versions = "|".join(sorted(versions)) or None
 
     return record
 
@@ -157,6 +217,7 @@ def run_scan(
     verify_readonly: bool = False,
     snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
     similarity_threshold: int = DEFAULT_SIMILARITY_THRESHOLD,
+    full: bool = False,
 ) -> None:
     if not target.exists():
         print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
@@ -190,18 +251,81 @@ def run_scan(
     scanned_paths: list[str] = []
     duplicate_candidates: list[DuplicateRecord] = []
     image_hash_candidates: list[SimilarityRecord] = []
+    known_digests: dict[str, str] = {}
+    touches: list[tuple[str, str]] = []
+    reused_count = 0
+    added_count = 0
+    reprocessed_count = 0
 
     # One PATH lookup for the whole run instead of one per file; when
     # ExifTool is absent the scan behaves exactly like V2.5.1.
     exif_enabled = exiftool_available()
 
+    # F1 incremental: preload fingerprints once (one query, ~50k small
+    # rows fit in memory comfortably) instead of one SELECT per file.
+    # --full still preloads (for exact new/reprocessed counters) but
+    # never takes the reuse shortcut (calibration escape hatch).
+    scan_start_iso = datetime.now(timezone.utc).isoformat()
+    fingerprints = database.fetch_fingerprints(conn)
+
     count = 0
     for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
-        record = _scan_one_file(file_path, enable_exif=exif_enabled)
+        try:
+            basic = get_basic_metadata(file_path)
+        except OSError:
+            record = _scan_one_file(file_path, enable_exif=exif_enabled)
+            record.last_seen_at = scan_start_iso
+            record.file_state = "active"
+            record.duplicate_group = None
+            record.similar_group = None
+            database.upsert_file(conn, record)
+            scanned_paths.append(record.path)
+            if str(file_path) in fingerprints:
+                reprocessed_count += 1
+            else:
+                added_count += 1
+            count += 1
+            if not quiet and count % _PROGRESS_INTERVAL == 0:
+                print(f"Escaneados {count} archivos...")
+            continue
+
+        stored = fingerprints.get(basic.path)
+        if not full and _fingerprint_match(stored, basic, exif_enabled):
+            # Unchanged bytes + fresh extractors: touch only. Hashes are
+            # reused from the catalog (no byte reads, no subprocesses).
+            touches.append((scan_start_iso, basic.path))
+            scanned_paths.append(basic.path)
+            duplicate_candidates.append(
+                DuplicateRecord(path=basic.path, size_bytes=basic.size_bytes)
+            )
+            if stored.get("sha256"):
+                known_digests[basic.path] = stored["sha256"]
+            if basic.category == "image" and stored.get("perceptual_hash"):
+                image_hash_candidates.append(
+                    SimilarityRecord(
+                        path=basic.path,
+                        perceptual_hash=stored["perceptual_hash"],
+                        size_bytes=basic.size_bytes,
+                        extension=basic.extension,
+                    )
+                )
+            reused_count += 1
+            count += 1
+            if not quiet and count % _PROGRESS_INTERVAL == 0:
+                print(f"Escaneados {count} archivos...")
+            continue
+
+        record = _scan_one_file(file_path, enable_exif=exif_enabled, known_basic=basic)
+        record.last_seen_at = scan_start_iso
+        record.file_state = "active"
         record.duplicate_group = None
         record.similar_group = None
         database.upsert_file(conn, record)
         scanned_paths.append(record.path)
+        if stored is None:
+            added_count += 1
+        else:
+            reprocessed_count += 1
         if record.scan_status == "ok":
             duplicate_candidates.append(
                 DuplicateRecord(path=record.path, size_bytes=record.size_bytes)
@@ -219,6 +343,7 @@ def run_scan(
         if not quiet and count % _PROGRESS_INTERVAL == 0:
             print(f"Escaneados {count} archivos...")
 
+    database.touch_files(conn, touches)
     conn.commit()
 
     def _on_hash_error(path: str, exc: Exception) -> None:
@@ -226,8 +351,13 @@ def run_scan(
             print(f"AVISO: no se pudo calcular hash de {path}: {exc}", file=sys.stderr)
         database.set_scan_error(conn, path, f"hash: {exc}")
 
-    dup_stats = find_duplicates(duplicate_candidates, on_hash_error=_on_hash_error)
+    dup_stats = find_duplicates(
+        duplicate_candidates,
+        on_hash_error=_on_hash_error,
+        known_digests=known_digests,
+    )
     database.clear_duplicate_groups(conn, scanned_paths)
+    database.set_digests(conn, dup_stats.digests)
     for path, group_id in dup_stats.group_by_path.items():
         database.set_duplicate_group(conn, path, group_id)
     conn.commit()
@@ -236,6 +366,11 @@ def run_scan(
     database.clear_similar_groups(conn, scanned_paths)
     for path, group_id in sim_stats.group_by_path.items():
         database.set_similar_group(conn, path, group_id)
+    conn.commit()
+
+    # F1: rows observed before but missing now become stale (kept for
+    # audit, detached from groups, excluded from views).
+    stale_count = database.mark_stale(conn, scan_start_iso)
     conn.commit()
 
     if verify_readonly:
@@ -287,6 +422,10 @@ def run_scan(
         exif_date_count=exif_counts["with_capture_date"],
         exif_device_count=exif_counts["with_device"],
         exif_gps_count=exif_counts["with_gps"],
+        reused_count=reused_count,
+        added_count=added_count,
+        reprocessed_count=reprocessed_count,
+        stale_count=stale_count,
     )
     print()
     print(summary)
@@ -1053,6 +1192,62 @@ def run_person_split(
     print(f"split -> {person_id} files={len(file_paths)}")
 
 
+def run_search(
+    db_path: Path = DEFAULT_DB_PATH,
+    show_files: bool = False,
+    order_by: str = "path",
+    descending: bool = False,
+    limit: int = 100,
+    **filter_kwargs,
+) -> None:
+    """Structured catalog search (V3.2). Prints opaque file IDs plus a
+    few columns by default; real paths only under --show-files."""
+    from .metadata import human_readable_size
+    from .person_identity import resolve_file_persons
+    from .query import cli_filters, run_query
+
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    _require_catalog(conn, db_path)
+    try:
+        filters = cli_filters(**filter_kwargs)
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        rows, total = run_query(
+            conn, filters, order_by=order_by, descending=descending, limit=limit
+        )
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    persons_by_path = resolve_file_persons(conn)
+    conn.close()
+
+    print()
+    print("=== SEARCH ===")
+    for row in rows:
+        persons = ",".join(sorted(persons_by_path.get(row["path"], ()))) or "-"
+        line = (
+            f"{row['file_id']} category={row['category']} "
+            f"size={human_readable_size(row['size_bytes'] or 0)} "
+            f"capture={row['capture_date'] or '-'} "
+            f"device={row['device_model'] or row['device_make'] or '-'} "
+            f"persons={persons}"
+        )
+        if show_files:
+            line += f" path={row['path']}"
+        print(line)
+    print(f"matches={total} shown={len(rows)}")
+
+
 def run_organize_preview(
     db_path: Path = DEFAULT_DB_PATH,
     plan_path: Path = DEFAULT_PLAN_PATH,
@@ -1539,19 +1734,31 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
         )
         raise SystemExit(1)
     conn = database.connect(db_path)
-    category_totals = database.fetch_category_totals(conn)
+    # F1: global views cover active files only (None = pre-F1 caller DB
+    # without the column: fall back to the legacy unscoped behavior).
+    active_paths = database.fetch_active_paths(conn)
+    scoped = None if active_paths is None else sorted(active_paths)
+    if scoped is not None and not scoped:
+        category_totals = []
+        dup_groups = []
+        error_count = 0
+        image_hash_count = 0
+        sim_groups = []
+        exif_counts = {"with_capture_date": 0, "with_device": 0, "with_gps": 0}
+    else:
+        category_totals = database.fetch_category_totals(conn, paths=scoped)
+        dup_groups = database.fetch_duplicate_groups(conn)
+        error_count = database.fetch_error_count(conn, paths=scoped)
+        image_hash_count = database.fetch_perceptual_hash_count(conn, paths=scoped)
+        sim_groups = database.fetch_similar_groups(conn)
+        exif_counts = database.fetch_exif_counts(conn, paths=scoped)
     total_files = sum(row["count"] for row in category_totals)
     total_bytes = sum(row["total_bytes"] or 0 for row in category_totals)
-    dup_groups = database.fetch_duplicate_groups(conn)
     duplicate_file_count = sum(row["count"] for row in dup_groups)
     recoverable_bytes = sum(
         (row["count"] - 1) * row["size_bytes"] for row in dup_groups
     )
-    error_count = database.fetch_error_count(conn)
-    image_hash_count = database.fetch_perceptual_hash_count(conn)
-    sim_groups = database.fetch_similar_groups(conn)
     similar_grouped_file_count = sum(row["count"] for row in sim_groups)
-    exif_counts = database.fetch_exif_counts(conn)
 
     summary = build_summary_text(
         category_totals=category_totals,
@@ -1665,6 +1872,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Distancia Hamming máxima (0-64) para agrupar imágenes como "
             f"visualmente similares (por defecto {DEFAULT_SIMILARITY_THRESHOLD})."
+        ),
+    )
+    scan_parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Re-analizar todos los archivos aunque su fingerprint "
+            "(tamaño+mtime) no haya cambiado. Sin este flag, el scan es "
+            "incremental: reutiliza lo ya catalogado."
         ),
     )
 
@@ -1848,6 +2064,72 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     split_parser.add_argument("--name", default=None, help="Nombre para mostrar.")
 
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Buscar en el catálogo por filtros estructurados (V3.2).",
+    )
+    search_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    search_parser.add_argument(
+        "--category", default=None, help="video,image,... (coma = OR)."
+    )
+    search_parser.add_argument(
+        "--extension", default=None, help=".mp4,.jpg,... (coma = OR)."
+    )
+    search_parser.add_argument(
+        "--person",
+        action="append",
+        default=None,
+        help="P000N, PERSON_0007 o nombre; repetible (todas deben aparecer).",
+    )
+    search_parser.add_argument(
+        "--device", default=None, help="Fabricante o modelo exacto (ej. POCO X6)."
+    )
+    search_parser.add_argument("--year", default=None, help="Año de captura (2025).")
+    search_parser.add_argument(
+        "--min-duration", type=float, default=None, help="Segundos."
+    )
+    search_parser.add_argument(
+        "--max-duration", type=float, default=None, help="Segundos."
+    )
+    search_parser.add_argument(
+        "--min-size", default=None, help="Bytes con sufijo (500MB, 1.5G)."
+    )
+    search_parser.add_argument(
+        "--max-size", default=None, help="Bytes con sufijo (500MB, 1.5G)."
+    )
+    search_parser.add_argument(
+        "--has-gps", action="store_true", help="Solo archivos con GPS."
+    )
+    search_parser.add_argument(
+        "--has-device", action="store_true", help="Solo con dispositivo conocido."
+    )
+    search_parser.add_argument(
+        "--has-date", action="store_true", help="Solo con fecha de captura."
+    )
+    search_parser.add_argument(
+        "--bbox",
+        default=None,
+        help="Caja GPS: lat_min,lat_max,lon_min,lon_max.",
+    )
+    search_parser.add_argument(
+        "--duplicates", action="store_true", help="Solo duplicados exactos."
+    )
+    search_parser.add_argument(
+        "--similar", action="store_true", help="Solo con similar visual."
+    )
+    search_parser.add_argument(
+        "--sort",
+        default="path",
+        choices=["path", "size_bytes", "capture_date", "duration_seconds", "category"],
+    )
+    search_parser.add_argument("--desc", action="store_true")
+    search_parser.add_argument("--limit", type=int, default=100)
+    search_parser.add_argument(
+        "--show-files",
+        action="store_true",
+        help="Incluye rutas reales (solo ejecución manual).",
+    )
+
     return parser
 
 
@@ -1865,6 +2147,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             verify_readonly=args.verify_readonly,
             snapshot_dir=args.snapshot_dir,
             similarity_threshold=args.similarity_threshold,
+            full=args.full,
         )
     elif args.command == "summary":
         run_summary(db_path=args.db)
@@ -1952,6 +2235,29 @@ def main(argv: Optional[list[str]] = None) -> None:
             file_paths=args.files,
             db_path=args.db,
             name=args.name,
+        )
+    elif args.command == "search":
+        run_search(
+            db_path=args.db,
+            show_files=args.show_files,
+            order_by=args.sort,
+            descending=args.desc,
+            limit=args.limit,
+            category=args.category,
+            extension=args.extension,
+            persons=args.person,
+            device=args.device,
+            year=args.year,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+            min_size=args.min_size,
+            max_size=args.max_size,
+            has_gps=args.has_gps,
+            has_device=args.has_device,
+            has_date=args.has_date,
+            bbox=args.bbox,
+            duplicates=args.duplicates,
+            similar=args.similar,
         )
 
 

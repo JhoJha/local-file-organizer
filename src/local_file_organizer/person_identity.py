@@ -253,8 +253,10 @@ def split_files(
 
 def effective_summary(conn: sqlite3.Connection) -> list[dict]:
     """One row per effective person: id, display name, file/image/video
-    counts and member machine labels, ordered by person_id."""
+    counts and member machine labels, ordered by person_id. Stale files
+    (F1) are excluded when the catalog tracks them."""
     resolved = resolve_file_persons(conn)
+    active_paths = database.fetch_active_paths(conn)
     categories: dict[str, str] = {}
     try:
         for row in conn.execute("SELECT path, category FROM files"):
@@ -269,6 +271,8 @@ def effective_summary(conn: sqlite3.Connection) -> list[dict]:
 
     files_by_person: dict[str, set[str]] = {}
     for file_path, persons in resolved.items():
+        if active_paths is not None and file_path not in active_paths:
+            continue
         for person in persons:
             files_by_person.setdefault(person, set()).add(file_path)
 

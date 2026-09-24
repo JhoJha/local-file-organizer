@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS files (
     scan_error TEXT,
 
     metadata_status TEXT,
-    metadata_error TEXT
+    metadata_error TEXT,
+
+    last_seen_at TEXT,
+    file_state TEXT DEFAULT 'active',
+    extractor_versions TEXT
 );
 CREATE TABLE IF NOT EXISTS video_frame_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +140,11 @@ _ADDED_COLUMNS: dict[str, str] = {
     "gps_longitude": "REAL",
     "gps_altitude": "REAL",
     "orientation": "INTEGER",
+    # F1 incremental scan: fingerprint bookkeeping (NULL = pre-F1 row,
+    # treated as "reprocess once").
+    "last_seen_at": "TEXT",
+    "file_state": "TEXT",
+    "extractor_versions": "TEXT",
 }
 
 _FILE_COLUMNS = [
@@ -148,6 +157,7 @@ _FILE_COLUMNS = [
     "gps_latitude", "gps_longitude", "gps_altitude", "orientation",
     "scan_status", "scan_error",
     "metadata_status", "metadata_error",
+    "last_seen_at", "file_state", "extractor_versions",
 ]
 
 
@@ -214,19 +224,57 @@ class FileRecord:
     metadata_status: str = "skipped"
     metadata_error: Optional[str] = None
 
+    # F1 incremental bookkeeping: last_seen_at is refreshed on every
+    # scan that observes the file; file_state is 'active' or 'stale'
+    # (seen before, missing now — kept for audit/V5 path_history);
+    # extractor_versions records which extractors produced this row.
+    last_seen_at: Optional[str] = None
+    file_state: str = "active"
+    extractor_versions: Optional[str] = None
+
 
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    init_db(conn)
+    try:
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+    except sqlite3.DatabaseError as exc:
+        # A garbage-filled path (not a database at all) used to surface
+        # as a raw traceback from deep inside init_db.
+        conn.close()
+        raise sqlite3.DatabaseError(f"catálogo ilegible o corrupto: {db_path}") from exc
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _migrate_added_columns(conn)
+    _create_search_indexes(conn)
     conn.commit()
+
+
+# V3.2 structured search: indexes over the filter fields so 50k+
+# catalogs answer without full table scans. Created AFTER the column
+# migration (a legacy/hand-made DB may miss the column entirely) and
+# each in its own try/except: indexes are performance-only and must
+# never break connect() the way a failed executescript would.
+_SEARCH_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_files_category ON files(category)",
+    "CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension)",
+    "CREATE INDEX IF NOT EXISTS idx_files_size_bytes ON files(size_bytes)",
+    "CREATE INDEX IF NOT EXISTS idx_files_duration ON files(duration_seconds)",
+    "CREATE INDEX IF NOT EXISTS idx_files_capture_date ON files(capture_date)",
+    "CREATE INDEX IF NOT EXISTS idx_files_device_model ON files(device_model)",
+]
+
+
+def _create_search_indexes(conn: sqlite3.Connection) -> None:
+    for statement in _SEARCH_INDEXES:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError:
+            continue
 
 
 def _migrate_added_columns(conn: sqlite3.Connection) -> None:
@@ -260,6 +308,26 @@ def upsert_file(conn: sqlite3.Connection, record: FileRecord) -> None:
 def set_duplicate_group(conn: sqlite3.Connection, path: str, group_id: Optional[str]) -> None:
     conn.execute(
         "UPDATE files SET duplicate_group = ? WHERE path = ?", (group_id, path)
+    )
+
+
+def set_digests(conn: sqlite3.Connection, digests: dict[str, str]) -> None:
+    """Bulk-persist SHA-256 digests computed during duplicate detection
+    (F1: without this the catalog could never reuse them and every scan
+    would re-read every byte of every size-collision group).
+
+    A persisted digest also retires a stale ``hash: ...`` scan_error
+    note: digest present means the last known hash outcome was success.
+    Any other scan_error text is left untouched.
+    """
+    if not digests:
+        return
+    conn.executemany(
+        "UPDATE files SET sha256 = ?, "
+        "scan_error = CASE WHEN scan_error LIKE 'hash:%' THEN NULL "
+        "ELSE scan_error END "
+        "WHERE path = ?",
+        [(digest, path) for path, digest in digests.items()],
     )
 
 
@@ -384,8 +452,19 @@ def fetch_similar_files(conn: sqlite3.Connection, group_id: Optional[str] = None
     return cur.fetchall()
 
 
-def fetch_perceptual_hash_count(conn: sqlite3.Connection) -> int:
-    cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
+def fetch_perceptual_hash_count(
+    conn: sqlite3.Connection, paths: Optional[list[str]] = None
+) -> int:
+    if paths is None:
+        cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
+        return cur.fetchone()[0]
+    if not paths:
+        return 0
+    placeholders = ", ".join("?" for _ in paths)
+    cur = conn.execute(
+        f"SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL AND path IN ({placeholders})",
+        paths,
+    )
     return cur.fetchone()[0]
 
 
@@ -720,3 +799,66 @@ def fetch_file_links(conn: sqlite3.Connection) -> list:
         "SELECT * FROM file_person_links ORDER BY file_path, person_id"
     )
     return cur.fetchall()
+
+
+# --- F1 incremental scan -------------------------------------------------
+# A file is skippable when its cheap fingerprint (size + mtime) matches
+# the catalog AND the extractors that produced the row cover everything
+# the current scan would run. Fresh/legacy rows (NULL versions) always
+# reprocess once; 'other'-category files need no extractor at all.
+
+def fetch_fingerprints(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Map path -> stored fingerprint columns for the whole catalog."""
+    try:
+        rows = conn.execute(
+            "SELECT path, size_bytes, modified_at, extractor_versions, "
+            "sha256, perceptual_hash, file_state FROM files"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {
+        row["path"]: {
+            "size_bytes": row["size_bytes"],
+            "modified_at": row["modified_at"],
+            "extractor_versions": row["extractor_versions"],
+            "sha256": row["sha256"],
+            "perceptual_hash": row["perceptual_hash"],
+            "file_state": row["file_state"],
+        }
+        for row in rows
+    }
+
+
+def touch_files(conn: sqlite3.Connection, touches: list[tuple[str, str]]) -> None:
+    """Bulk-refresh (last_seen_at, active) for fingerprint-matched files."""
+    if not touches:
+        return
+    conn.executemany(
+        "UPDATE files SET last_seen_at = ?, file_state = 'active' WHERE path = ?",
+        touches,
+    )
+
+
+def mark_stale(conn: sqlite3.Connection, cutoff_iso: str) -> int:
+    """Mark rows not observed since cutoff as stale and detach them from
+    duplicate/similar groups. Returns the stale count."""
+    cur = conn.execute(
+        "UPDATE files SET file_state = 'stale', "
+        "duplicate_group = NULL, similar_group = NULL "
+        "WHERE COALESCE(file_state, 'active') = 'active' "
+        "AND (last_seen_at IS NULL OR last_seen_at < ?)",
+        (cutoff_iso,),
+    )
+    return cur.rowcount
+
+
+def fetch_active_paths(conn: sqlite3.Connection) -> Optional[set[str]]:
+    """Paths usable by global views (summary/persons). None when the
+    column predates the caller DB (treat as 'everything active')."""
+    try:
+        rows = conn.execute(
+            "SELECT path FROM files WHERE COALESCE(file_state, 'active') = 'active'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    return {row["path"] for row in rows}

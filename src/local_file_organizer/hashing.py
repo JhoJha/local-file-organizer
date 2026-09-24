@@ -12,7 +12,9 @@ import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
+
+from .scanner import is_regular_file
 
 _HASH_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
@@ -51,30 +53,52 @@ class DuplicateStats:
     total_duplicate_groups: int
     duplicated_space_bytes: int
     recoverable_space_bytes: int
+    # path -> SHA-256 computed during this run (F1: persisted to the
+    # catalog so future scans reuse digests without re-reading bytes).
+    digests: dict[str, str]
 
 
 def find_duplicates(
     records: Iterable[DuplicateRecord],
     hash_fn=sha256_file,
     on_hash_error=None,
+    known_digests: Optional[dict[str, str]] = None,
 ) -> DuplicateStats:
     """Run the full size -> hash duplicate-detection pipeline.
 
     ``hash_fn`` is injectable for testing. ``on_hash_error(path, exc)`` is
     called (if provided) when a candidate file can't be hashed; that file is
     simply excluded from duplicate grouping rather than aborting the run.
+
+    ``known_digests`` (F1 incremental) maps path -> stored SHA-256: files
+    whose bytes were not re-read reuse their catalog digest, so only
+    new/changed files in size-collision groups pay for hashing. A stored
+    None (never hashed) falls back to hashing now.
     """
     size_groups = group_by_size(records)
+    known = known_digests or {}
 
     hash_groups: dict[str, list[DuplicateRecord]] = defaultdict(list)
+    digests: dict[str, str] = dict(known)
     for candidates in size_groups.values():
         for record in candidates:
-            try:
-                digest = hash_fn(Path(record.path))
-            except OSError as exc:
-                if on_hash_error is not None:
-                    on_hash_error(record.path, exc)
-                continue
+            digest = known.get(record.path)
+            if digest is None:
+                if not is_regular_file(Path(record.path)):
+                    if on_hash_error is not None:
+                        on_hash_error(record.path, OSError("not a regular file"))
+                    digests.pop(record.path, None)
+                    continue
+                try:
+                    digest = hash_fn(Path(record.path))
+                except OSError as exc:
+                    if on_hash_error is not None:
+                        on_hash_error(record.path, exc)
+                    # A fresh read failure invalidates any previously
+                    # stored digest for this path.
+                    digests.pop(record.path, None)
+                    continue
+                digests[record.path] = digest
             hash_groups[digest].append(record)
 
     confirmed_groups = {
@@ -107,4 +131,5 @@ def find_duplicates(
         total_duplicate_groups=len(ordered),
         duplicated_space_bytes=duplicated_space_bytes,
         recoverable_space_bytes=recoverable_space_bytes,
+        digests=digests,
     )
