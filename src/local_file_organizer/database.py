@@ -337,30 +337,91 @@ def set_scan_error(conn: sqlite3.Connection, path: str, message: str) -> None:
     )
 
 
+_SQL_CHUNK_SIZE = 500
+
+
+class CategoryTotalRow:
+    """Row-like object for category totals supporting both key and index access."""
+
+    def __init__(self, category: str, count: int, total_bytes: int):
+        self.category = category
+        self.count = count
+        self.total_bytes = total_bytes
+
+    def __getitem__(self, key):
+        if key == 0 or key == "category":
+            return self.category
+        if key == 1 or key == "count":
+            return self.count
+        if key == 2 or key == "total_bytes":
+            return self.total_bytes
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 def clear_duplicate_groups(conn: sqlite3.Connection, paths: list[str]) -> None:
     if not paths:
         return
-    placeholders = ", ".join("?" for _ in paths)
-    conn.execute(
-        f"UPDATE files SET duplicate_group = NULL WHERE path IN ({placeholders})",
-        paths,
-    )
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        conn.execute(
+            f"UPDATE files SET duplicate_group = NULL WHERE path IN ({placeholders})",
+            chunk,
+        )
 
 
-def fetch_category_totals(conn: sqlite3.Connection, paths: Optional[list[str]] = None):
+def fetch_category_totals(
+    conn: sqlite3.Connection,
+    paths: Optional[list[str]] = None,
+    *,
+    active_only: bool = False,
+):
     if paths is None:
+        where = " WHERE COALESCE(file_state, 'active') = 'active'" if active_only else ""
         cur = conn.execute(
-            "SELECT category, COUNT(*) AS count, SUM(size_bytes) AS total_bytes "
-            "FROM files GROUP BY category ORDER BY category"
+            f"SELECT category, COUNT(*) AS count, SUM(size_bytes) AS total_bytes "
+            f"FROM files{where} GROUP BY category ORDER BY category"
         )
         return cur.fetchall()
-    placeholders = ", ".join("?" for _ in paths)
-    cur = conn.execute(
-        f"SELECT category, COUNT(*) AS count, SUM(size_bytes) AS total_bytes "
-        f"FROM files WHERE path IN ({placeholders}) GROUP BY category ORDER BY category",
-        paths,
-    )
-    return cur.fetchall()
+
+    if not paths:
+        return []
+
+    if len(paths) <= _SQL_CHUNK_SIZE:
+        placeholders = ", ".join("?" for _ in paths)
+        cur = conn.execute(
+            f"SELECT category, COUNT(*) AS count, SUM(size_bytes) AS total_bytes "
+            f"FROM files WHERE path IN ({placeholders}) GROUP BY category ORDER BY category",
+            paths,
+        )
+        return cur.fetchall()
+
+    aggregated: dict[str, dict[str, int]] = {}
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        cur = conn.execute(
+            f"SELECT category, COUNT(*) AS count, SUM(size_bytes) AS total_bytes "
+            f"FROM files WHERE path IN ({placeholders}) GROUP BY category",
+            chunk,
+        )
+        for row in cur.fetchall():
+            cat = row["category"]
+            if cat not in aggregated:
+                aggregated[cat] = {"count": 0, "total_bytes": 0}
+            aggregated[cat]["count"] += row["count"]
+            aggregated[cat]["total_bytes"] += row["total_bytes"] or 0
+
+    return [
+        CategoryTotalRow(cat, aggregated[cat]["count"], aggregated[cat]["total_bytes"])
+        for cat in sorted(aggregated)
+    ]
 
 
 def fetch_duplicate_groups(conn: sqlite3.Connection):
@@ -392,20 +453,44 @@ _ERROR_CONDITION = (
 )
 
 
-def fetch_error_count(conn: sqlite3.Connection, paths: Optional[list[str]] = None) -> int:
+def fetch_error_count(
+    conn: sqlite3.Connection,
+    paths: Optional[list[str]] = None,
+    *,
+    active_only: bool = False,
+) -> int:
     """Count files that could not be *fully* analyzed: the basic scan
     failed (scan_status='error'), specialized metadata extraction failed
     (metadata_status='error', e.g. a corrupt video ffprobe can't parse), or
     an auxiliary step such as hashing left a note in scan_error."""
     if paths is None:
-        cur = conn.execute(f"SELECT COUNT(*) FROM files WHERE {_ERROR_CONDITION}")
+        where = f"WHERE {_ERROR_CONDITION}"
+        if active_only:
+            where += " AND (COALESCE(file_state, 'active') = 'active')"
+        cur = conn.execute(f"SELECT COUNT(*) FROM files {where}")
         return cur.fetchone()[0]
-    placeholders = ", ".join("?" for _ in paths)
-    cur = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE {_ERROR_CONDITION} AND path IN ({placeholders})",
-        paths,
-    )
-    return cur.fetchone()[0]
+
+    if not paths:
+        return 0
+
+    if len(paths) <= _SQL_CHUNK_SIZE:
+        placeholders = ", ".join("?" for _ in paths)
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE {_ERROR_CONDITION} AND path IN ({placeholders})",
+            paths,
+        )
+        return cur.fetchone()[0]
+
+    total = 0
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE {_ERROR_CONDITION} AND path IN ({placeholders})",
+            chunk,
+        )
+        total += cur.fetchone()[0]
+    return total
 
 
 def fetch_all_files(conn: sqlite3.Connection):
@@ -422,11 +507,13 @@ def set_similar_group(conn: sqlite3.Connection, path: str, group_id: Optional[st
 def clear_similar_groups(conn: sqlite3.Connection, paths: list[str]) -> None:
     if not paths:
         return
-    placeholders = ", ".join("?" for _ in paths)
-    conn.execute(
-        f"UPDATE files SET similar_group = NULL WHERE path IN ({placeholders})",
-        paths,
-    )
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        conn.execute(
+            f"UPDATE files SET similar_group = NULL WHERE path IN ({placeholders})",
+            chunk,
+        )
 
 
 def fetch_similar_groups(conn: sqlite3.Connection):
@@ -453,46 +540,105 @@ def fetch_similar_files(conn: sqlite3.Connection, group_id: Optional[str] = None
 
 
 def fetch_perceptual_hash_count(
-    conn: sqlite3.Connection, paths: Optional[list[str]] = None
+    conn: sqlite3.Connection,
+    paths: Optional[list[str]] = None,
+    *,
+    active_only: bool = False,
 ) -> int:
     if paths is None:
-        cur = conn.execute("SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL")
+        where = " WHERE perceptual_hash IS NOT NULL"
+        if active_only:
+            where += " AND (COALESCE(file_state, 'active') = 'active')"
+        cur = conn.execute(f"SELECT COUNT(*) FROM files{where}")
         return cur.fetchone()[0]
     if not paths:
         return 0
-    placeholders = ", ".join("?" for _ in paths)
-    cur = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL AND path IN ({placeholders})",
-        paths,
-    )
-    return cur.fetchone()[0]
+    if len(paths) <= _SQL_CHUNK_SIZE:
+        placeholders = ", ".join("?" for _ in paths)
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL AND path IN ({placeholders})",
+            paths,
+        )
+        return cur.fetchone()[0]
+
+    total = 0
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE perceptual_hash IS NOT NULL AND path IN ({placeholders})",
+            chunk,
+        )
+        total += cur.fetchone()[0]
+    return total
 
 
-def fetch_exif_counts(conn: sqlite3.Connection, paths: Optional[list[str]] = None) -> dict[str, int]:
+def fetch_exif_counts(
+    conn: sqlite3.Connection,
+    paths: Optional[list[str]] = None,
+    *,
+    active_only: bool = False,
+) -> dict[str, int]:
     """Count files carrying EXIF/XMP enrichment: capture date, device
     (make or model) and GPS coordinates. Always scoped to the current
     scan when ``paths`` is given, like the other fetch helpers."""
-    scope = ""
-    params: list[str] = []
-    if paths is not None:
+    if paths is None:
+        scope = " WHERE (COALESCE(file_state, 'active') = 'active')" if active_only else ""
+        pfx = " AND" if scope else " WHERE"
+        counts = {}
+        counts["with_capture_date"] = conn.execute(
+            f"SELECT COUNT(*) FROM files{scope}{pfx} capture_date IS NOT NULL"
+        ).fetchone()[0]
+        counts["with_device"] = conn.execute(
+            f"SELECT COUNT(*) FROM files{scope}{pfx} (device_make IS NOT NULL OR device_model IS NOT NULL)"
+        ).fetchone()[0]
+        counts["with_gps"] = conn.execute(
+            f"SELECT COUNT(*) FROM files{scope}{pfx} (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL)"
+        ).fetchone()[0]
+        return counts
+
+    if not paths:
+        return {"with_capture_date": 0, "with_device": 0, "with_gps": 0}
+
+    if len(paths) <= _SQL_CHUNK_SIZE:
         placeholders = ", ".join("?" for _ in paths)
         scope = f" AND path IN ({placeholders})"
-        params = list(paths)
-    counts = {}
-    counts["with_capture_date"] = conn.execute(
-        f"SELECT COUNT(*) FROM files WHERE capture_date IS NOT NULL{scope}",
-        params,
-    ).fetchone()[0]
-    counts["with_device"] = conn.execute(
-        "SELECT COUNT(*) FROM files "
-        f"WHERE (device_make IS NOT NULL OR device_model IS NOT NULL){scope}",
-        params,
-    ).fetchone()[0]
-    counts["with_gps"] = conn.execute(
-        "SELECT COUNT(*) FROM files "
-        f"WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL{scope}",
-        params,
-    ).fetchone()[0]
+        counts = {}
+        counts["with_capture_date"] = conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE capture_date IS NOT NULL{scope}",
+            paths,
+        ).fetchone()[0]
+        counts["with_device"] = conn.execute(
+            f"SELECT COUNT(*) FROM files "
+            f"WHERE (device_make IS NOT NULL OR device_model IS NOT NULL){scope}",
+            paths,
+        ).fetchone()[0]
+        counts["with_gps"] = conn.execute(
+            f"SELECT COUNT(*) FROM files "
+            f"WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL{scope}",
+            paths,
+        ).fetchone()[0]
+        return counts
+
+    counts = {"with_capture_date": 0, "with_device": 0, "with_gps": 0}
+    for i in range(0, len(paths), _SQL_CHUNK_SIZE):
+        chunk = paths[i : i + _SQL_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        scope = f" AND path IN ({placeholders})"
+        counts["with_capture_date"] += conn.execute(
+            f"SELECT COUNT(*) FROM files WHERE capture_date IS NOT NULL{scope}",
+            chunk,
+        ).fetchone()[0]
+        counts["with_device"] += conn.execute(
+            f"SELECT COUNT(*) FROM files "
+            f"WHERE (device_make IS NOT NULL OR device_model IS NOT NULL){scope}",
+            chunk,
+        ).fetchone()[0]
+        counts["with_gps"] += conn.execute(
+            f"SELECT COUNT(*) FROM files "
+            f"WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL{scope}",
+            chunk,
+        ).fetchone()[0]
     return counts
 
 

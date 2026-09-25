@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -99,6 +100,23 @@ class ComputeDhashTests(unittest.TestCase):
         fake.write_bytes(b"this is not a valid image file")
         with self.assertRaises(Exception):
             compute_dhash(fake)
+
+    def test_dhash_determinism_with_flattened_data_and_legacy_fallback(self):
+        # Verify that get_flattened_data and legacy getdata produce identical dhash
+        path = self.dir / "sample.png"
+        _save_gradient(path)
+        hash_standard = compute_dhash(path)
+
+        # Mock Image.Image to remove get_flattened_data to test legacy fallback
+        with mock.patch.object(Image.Image, "get_flattened_data", create=True) as mocked:
+            del Image.Image.get_flattened_data
+            try:
+                hash_legacy = compute_dhash(path)
+            finally:
+                Image.Image.get_flattened_data = mocked
+
+        self.assertEqual(hash_standard, hash_legacy)
+        self.assertEqual(len(hash_standard), 16)
 
 
 class GetImageMetadataTests(unittest.TestCase):

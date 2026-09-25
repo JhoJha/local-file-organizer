@@ -1311,8 +1311,15 @@ def run_organize_preview(
 
     paths_by_destination: dict[str, list[str]] = {}
     if show_files:
-        rows = conn.execute("SELECT path FROM files ORDER BY path ASC").fetchall()
+        rows = conn.execute(
+            "SELECT path FROM files WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
+        ).fetchall()
         dest_by_index = [e["proposed_destination"] for e in entries]
+        if len(rows) != len(dest_by_index):
+            conn.close()
+            raise RuntimeError(
+                f"desincronización en organize-preview: {len(rows)} archivos activos pero {len(dest_by_index)} entradas de plan"
+            )
         for row, dest in zip(rows, dest_by_index):
             paths_by_destination.setdefault(dest, []).append(row["path"])
     conn.close()
@@ -1734,24 +1741,21 @@ def run_summary(db_path: Path = DEFAULT_DB_PATH) -> None:
         )
         raise SystemExit(1)
     conn = database.connect(db_path)
-    # F1: global views cover active files only (None = pre-F1 caller DB
-    # without the column: fall back to the legacy unscoped behavior).
-    active_paths = database.fetch_active_paths(conn)
-    scoped = None if active_paths is None else sorted(active_paths)
-    if scoped is not None and not scoped:
-        category_totals = []
+    # F1: global views cover active files only via SQL filtering.
+    category_totals = database.fetch_category_totals(conn, active_only=True)
+    total_files = sum(row["count"] for row in category_totals)
+    if total_files == 0:
         dup_groups = []
         error_count = 0
         image_hash_count = 0
         sim_groups = []
         exif_counts = {"with_capture_date": 0, "with_device": 0, "with_gps": 0}
     else:
-        category_totals = database.fetch_category_totals(conn, paths=scoped)
         dup_groups = database.fetch_duplicate_groups(conn)
-        error_count = database.fetch_error_count(conn, paths=scoped)
-        image_hash_count = database.fetch_perceptual_hash_count(conn, paths=scoped)
+        error_count = database.fetch_error_count(conn, active_only=True)
+        image_hash_count = database.fetch_perceptual_hash_count(conn, active_only=True)
         sim_groups = database.fetch_similar_groups(conn)
-        exif_counts = database.fetch_exif_counts(conn, paths=scoped)
+        exif_counts = database.fetch_exif_counts(conn, active_only=True)
     total_files = sum(row["count"] for row in category_totals)
     total_bytes = sum(row["total_bytes"] or 0 for row in category_totals)
     duplicate_file_count = sum(row["count"] for row in dup_groups)

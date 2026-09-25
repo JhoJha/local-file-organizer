@@ -64,7 +64,10 @@ def compute_dhash(path: Path, hash_size: int = _HASH_SIZE) -> str:
         small = img.convert("L").resize(
             (hash_size + 1, hash_size), Image.Resampling.LANCZOS
         )
-        pixels = list(small.getdata())
+        if hasattr(small, "get_flattened_data"):
+            pixels = list(small.get_flattened_data())
+        else:
+            pixels = list(small.getdata())
 
     bits = []
     row_width = hash_size + 1

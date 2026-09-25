@@ -391,6 +391,109 @@ class PersonClusterObservationTests(unittest.TestCase):
         self.assertEqual(database.fetch_person_cluster_observations(conn), [])
         conn.close()
 
+    def test_large_path_list_chunking(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        n = 1200
+        paths = [f"/path/file_{i:04d}.jpg" for i in range(n)]
+
+        # Insert 1200 files in bulk
+        conn.executemany(
+            "INSERT INTO files (path, name, extension, category, size_bytes, scan_status, "
+            "perceptual_hash, capture_date, device_make, gps_latitude, gps_longitude, "
+            "duplicate_group, similar_group, file_state) "
+            "VALUES (?, 'f.jpg', '.jpg', 'image', 100, 'ok', 'aabb1122', '2025-01-01', "
+            "'Camera', 10.0, 20.0, 'DUP_0001', 'SIM_0001', 'active')",
+            [(p,) for p in paths],
+        )
+        conn.commit()
+
+        # Test chunking across 1200 paths (> _SQL_CHUNK_SIZE of 500)
+        totals = database.fetch_category_totals(conn, paths=paths)
+        self.assertEqual(len(totals), 1)
+        self.assertEqual(totals[0]["category"], "image")
+        self.assertEqual(totals[0]["count"], n)
+        self.assertEqual(totals[0]["total_bytes"], n * 100)
+
+        err_count = database.fetch_error_count(conn, paths=paths)
+        self.assertEqual(err_count, 0)
+
+        hash_count = database.fetch_perceptual_hash_count(conn, paths=paths)
+        self.assertEqual(hash_count, n)
+
+        exif = database.fetch_exif_counts(conn, paths=paths)
+        self.assertEqual(exif["with_capture_date"], n)
+        self.assertEqual(exif["with_device"], n)
+        self.assertEqual(exif["with_gps"], n)
+
+        # Clear duplicate and similar groups across the 1200 paths
+        database.clear_duplicate_groups(conn, paths)
+        database.clear_similar_groups(conn, paths)
+        conn.commit()
+
+        cur = conn.execute("SELECT COUNT(*) FROM files WHERE duplicate_group IS NOT NULL")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur = conn.execute("SELECT COUNT(*) FROM files WHERE similar_group IS NOT NULL")
+        self.assertEqual(cur.fetchone()[0], 0)
+        conn.close()
+
+    def test_fetch_helpers_active_only(self):
+        from local_file_organizer import database
+
+        conn = connect(self.db_path)
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path="/active.jpg", name="active.jpg", extension=".jpg",
+                category="image", size_bytes=200, scan_status="ok",
+                metadata_status="ok", perceptual_hash="11223344",
+                capture_date="2025-01-01", device_make="Phone",
+                gps_latitude=1.0, gps_longitude=2.0, file_state="active",
+            ),
+        )
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path="/stale.jpg", name="stale.jpg", extension=".jpg",
+                category="image", size_bytes=300, scan_status="error",
+                scan_error="stale read error", metadata_status="error",
+                perceptual_hash="55667788", capture_date="2025-01-02",
+                device_make="OldPhone", gps_latitude=3.0, gps_longitude=4.0,
+                file_state="stale",
+            ),
+        )
+        conn.commit()
+
+        # active_only=True excludes stale.jpg
+        totals = database.fetch_category_totals(conn, active_only=True)
+        self.assertEqual(len(totals), 1)
+        self.assertEqual(totals[0]["count"], 1)
+        self.assertEqual(totals[0]["total_bytes"], 200)
+
+        # active_only=False includes stale.jpg
+        all_totals = database.fetch_category_totals(conn, active_only=False)
+        self.assertEqual(len(all_totals), 1)
+        self.assertEqual(all_totals[0]["count"], 2)
+        self.assertEqual(all_totals[0]["total_bytes"], 500)
+
+        self.assertEqual(database.fetch_error_count(conn, active_only=True), 0)
+        self.assertEqual(database.fetch_error_count(conn, active_only=False), 1)
+
+        self.assertEqual(database.fetch_perceptual_hash_count(conn, active_only=True), 1)
+        self.assertEqual(database.fetch_perceptual_hash_count(conn, active_only=False), 2)
+
+        exif_active = database.fetch_exif_counts(conn, active_only=True)
+        self.assertEqual(exif_active["with_capture_date"], 1)
+        self.assertEqual(exif_active["with_device"], 1)
+        self.assertEqual(exif_active["with_gps"], 1)
+
+        exif_all = database.fetch_exif_counts(conn, active_only=False)
+        self.assertEqual(exif_all["with_capture_date"], 2)
+        self.assertEqual(exif_all["with_device"], 2)
+        self.assertEqual(exif_all["with_gps"], 2)
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

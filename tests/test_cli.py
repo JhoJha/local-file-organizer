@@ -1310,6 +1310,62 @@ class OrganizePreviewCliTests(unittest.TestCase):
                         db_path=self.db_path, plan_path=self.plan_path, quiet=True)
         self.assertIn("ERROR: no existe el catálogo", err.getvalue())
 
+    def test_show_files_with_stale_files_maintains_alignment(self):
+        from local_file_organizer import database
+        from local_file_organizer.cli import run_organize_preview
+
+        conn = database.connect(self.db_path)
+        base = str(Path(self.tmpdir.name) / "media")
+        p_active_img = base + "/active_photo.jpg"
+        p_stale_img = base + "/0_stale_photo.jpg"
+        p_active_doc = base + "/active_doc.pdf"
+
+        # active photo -> Media/Sin_personas/
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=p_active_img, name="active_photo.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="ok",
+                file_state="active",
+            ),
+        )
+        # stale photo -> should be ignored by organize-preview
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=p_stale_img, name="stale_photo.jpg", extension=".jpg",
+                category="image", scan_status="ok", metadata_status="ok",
+                file_state="stale",
+            ),
+        )
+        # active doc -> Documentos/PDF/
+        database.upsert_file(
+            conn,
+            database.FileRecord(
+                path=p_active_doc, name="active_doc.pdf", extension=".pdf",
+                category="document", scan_status="ok", metadata_status="skipped",
+                file_state="active",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            run_organize_preview(
+                db_path=self.db_path,
+                plan_path=self.plan_path,
+                show_files=True,
+                quiet=False,
+            )
+        printed = output.getvalue()
+        self.assertNotIn("0_stale_photo.jpg", printed)
+        self.assertIn("active_photo.jpg", printed)
+        self.assertIn("active_doc.pdf", printed)
+        self.assertIn(f"- {p_active_img}", printed)
+        self.assertIn(f"- {p_active_doc}", printed)
+
 
 if __name__ == "__main__":
     unittest.main()
+
