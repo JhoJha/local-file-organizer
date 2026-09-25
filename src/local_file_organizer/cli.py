@@ -219,7 +219,58 @@ def run_scan(
     similarity_threshold: int = DEFAULT_SIMILARITY_THRESHOLD,
     full: bool = False,
 ) -> None:
-    if not target.exists():
+    """CLI adapter for the reusable scan application workflow."""
+    from .scan_workflow import (
+        TargetNotDirectoryError,
+        TargetNotFoundError,
+        generate_scan,
+    )
+
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    if extra_ignored_dirs:
+        ignored_dirs.update(extra_ignored_dirs)
+
+    def _on_progress(count: int) -> None:
+        if not quiet:
+            print(f"Escaneados {count} archivos...")
+
+    def _on_walk_error(err: ScanError) -> None:
+        if not quiet:
+            print(
+                f"AVISO: no se pudo listar {err.path}: {err.message}",
+                file=sys.stderr,
+            )
+
+    def _on_hash_error(path: str, exc: Exception) -> None:
+        if not quiet:
+            print(
+                f"AVISO: no se pudo calcular hash de {path}: {exc}",
+                file=sys.stderr,
+            )
+
+    try:
+        result = generate_scan(
+            target=target,
+            db_path=db_path,
+            csv_path=csv_path,
+            ignored_dirs=ignored_dirs,
+            verify_readonly=verify_readonly,
+            snapshot_dir=snapshot_dir,
+            similarity_threshold=similarity_threshold,
+            full=full,
+            progress_interval=_PROGRESS_INTERVAL,
+            iter_files_fn=iter_files,
+            get_basic_metadata_fn=get_basic_metadata,
+            scan_one_file_fn=_scan_one_file,
+            fingerprint_match_fn=_fingerprint_match,
+            exiftool_available_fn=exiftool_available,
+            find_duplicates_fn=find_duplicates,
+            now_iso_fn=lambda: datetime.now(timezone.utc).isoformat(),
+            on_progress=_on_progress,
+            on_walk_error=_on_walk_error,
+            on_hash_error=_on_hash_error,
+        )
+    except TargetNotFoundError:
         print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
         print(
             "No se inventará ni escaneará ninguna otra ruta. Verifica el "
@@ -227,156 +278,12 @@ def run_scan(
             file=sys.stderr,
         )
         raise SystemExit(1)
-    if not target.is_dir():
+    except TargetNotDirectoryError:
         print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
         raise SystemExit(1)
 
-    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
-    if extra_ignored_dirs:
-        ignored_dirs.update(extra_ignored_dirs)
-
-    walk_errors: list[ScanError] = []
-
-    def _on_error(err: ScanError) -> None:
-        walk_errors.append(err)
-        if not quiet:
-            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
-
-    before_snapshot = None
-    if verify_readonly:
-        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
-        save_snapshot(before_snapshot, snapshot_dir / "before.json")
-
-    conn = database.connect(db_path)
-    scanned_paths: list[str] = []
-    duplicate_candidates: list[DuplicateRecord] = []
-    image_hash_candidates: list[SimilarityRecord] = []
-    known_digests: dict[str, str] = {}
-    touches: list[tuple[str, str]] = []
-    reused_count = 0
-    added_count = 0
-    reprocessed_count = 0
-
-    # One PATH lookup for the whole run instead of one per file; when
-    # ExifTool is absent the scan behaves exactly like V2.5.1.
-    exif_enabled = exiftool_available()
-
-    # F1 incremental: preload fingerprints once (one query, ~50k small
-    # rows fit in memory comfortably) instead of one SELECT per file.
-    # --full still preloads (for exact new/reprocessed counters) but
-    # never takes the reuse shortcut (calibration escape hatch).
-    scan_start_iso = datetime.now(timezone.utc).isoformat()
-    fingerprints = database.fetch_fingerprints(conn)
-
-    count = 0
-    for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
-        try:
-            basic = get_basic_metadata(file_path)
-        except OSError:
-            record = _scan_one_file(file_path, enable_exif=exif_enabled)
-            record.last_seen_at = scan_start_iso
-            record.file_state = "active"
-            record.duplicate_group = None
-            record.similar_group = None
-            database.upsert_file(conn, record)
-            scanned_paths.append(record.path)
-            if str(file_path) in fingerprints:
-                reprocessed_count += 1
-            else:
-                added_count += 1
-            count += 1
-            if not quiet and count % _PROGRESS_INTERVAL == 0:
-                print(f"Escaneados {count} archivos...")
-            continue
-
-        stored = fingerprints.get(basic.path)
-        if not full and _fingerprint_match(stored, basic, exif_enabled):
-            # Unchanged bytes + fresh extractors: touch only. Hashes are
-            # reused from the catalog (no byte reads, no subprocesses).
-            touches.append((scan_start_iso, basic.path))
-            scanned_paths.append(basic.path)
-            duplicate_candidates.append(
-                DuplicateRecord(path=basic.path, size_bytes=basic.size_bytes)
-            )
-            if stored.get("sha256"):
-                known_digests[basic.path] = stored["sha256"]
-            if basic.category == "image" and stored.get("perceptual_hash"):
-                image_hash_candidates.append(
-                    SimilarityRecord(
-                        path=basic.path,
-                        perceptual_hash=stored["perceptual_hash"],
-                        size_bytes=basic.size_bytes,
-                        extension=basic.extension,
-                    )
-                )
-            reused_count += 1
-            count += 1
-            if not quiet and count % _PROGRESS_INTERVAL == 0:
-                print(f"Escaneados {count} archivos...")
-            continue
-
-        record = _scan_one_file(file_path, enable_exif=exif_enabled, known_basic=basic)
-        record.last_seen_at = scan_start_iso
-        record.file_state = "active"
-        record.duplicate_group = None
-        record.similar_group = None
-        database.upsert_file(conn, record)
-        scanned_paths.append(record.path)
-        if stored is None:
-            added_count += 1
-        else:
-            reprocessed_count += 1
-        if record.scan_status == "ok":
-            duplicate_candidates.append(
-                DuplicateRecord(path=record.path, size_bytes=record.size_bytes)
-            )
-        if record.category == "image" and record.perceptual_hash:
-            image_hash_candidates.append(
-                SimilarityRecord(
-                    path=record.path,
-                    perceptual_hash=record.perceptual_hash,
-                    size_bytes=record.size_bytes,
-                    extension=record.extension,
-                )
-            )
-        count += 1
-        if not quiet and count % _PROGRESS_INTERVAL == 0:
-            print(f"Escaneados {count} archivos...")
-
-    database.touch_files(conn, touches)
-    conn.commit()
-
-    def _on_hash_error(path: str, exc: Exception) -> None:
-        if not quiet:
-            print(f"AVISO: no se pudo calcular hash de {path}: {exc}", file=sys.stderr)
-        database.set_scan_error(conn, path, f"hash: {exc}")
-
-    dup_stats = find_duplicates(
-        duplicate_candidates,
-        on_hash_error=_on_hash_error,
-        known_digests=known_digests,
-    )
-    database.clear_duplicate_groups(conn, scanned_paths)
-    database.set_digests(conn, dup_stats.digests)
-    for path, group_id in dup_stats.group_by_path.items():
-        database.set_duplicate_group(conn, path, group_id)
-    conn.commit()
-
-    sim_stats = group_similar_images(image_hash_candidates, threshold=similarity_threshold)
-    database.clear_similar_groups(conn, scanned_paths)
-    for path, group_id in sim_stats.group_by_path.items():
-        database.set_similar_group(conn, path, group_id)
-    conn.commit()
-
-    # F1: rows observed before but missing now become stale (kept for
-    # audit, detached from groups, excluded from views).
-    stale_count = database.mark_stale(conn, scan_start_iso)
-    conn.commit()
-
-    if verify_readonly:
-        after_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
-        save_snapshot(after_snapshot, snapshot_dir / "after.json")
-        readonly_diff = diff_snapshots(before_snapshot, after_snapshot)
+    if verify_readonly and result.readonly_diff is not None:
+        readonly_diff = result.readonly_diff
         print()
         print("=== VERIFICACIÓN READ-ONLY ===")
         print(
@@ -400,43 +307,16 @@ def run_scan(
                 for changed_path in paths[:20]:
                     print(f"  [{label}] {changed_path}", file=sys.stderr)
 
-    export_csv(conn, csv_path)
-
-    category_totals = database.fetch_category_totals(conn, paths=scanned_paths)
-    total_files = len(scanned_paths)
-    total_bytes = sum(row["total_bytes"] or 0 for row in category_totals)
-    error_count = database.fetch_error_count(conn, paths=scanned_paths)
-    exif_counts = database.fetch_exif_counts(conn, paths=scanned_paths)
-
-    summary = build_summary_text(
-        category_totals=category_totals,
-        total_files=total_files,
-        total_bytes=total_bytes,
-        duplicate_file_count=dup_stats.total_duplicate_files,
-        duplicate_group_count=dup_stats.total_duplicate_groups,
-        recoverable_bytes=dup_stats.recoverable_space_bytes,
-        error_count=error_count,
-        image_hash_count=len(image_hash_candidates),
-        similar_group_count=sim_stats.total_groups,
-        similar_grouped_file_count=sim_stats.total_grouped_files,
-        exif_date_count=exif_counts["with_capture_date"],
-        exif_device_count=exif_counts["with_device"],
-        exif_gps_count=exif_counts["with_gps"],
-        reused_count=reused_count,
-        added_count=added_count,
-        reprocessed_count=reprocessed_count,
-        stale_count=stale_count,
-    )
     print()
-    print(summary)
+    print(result.summary)
     print()
     print(f"Catálogo SQLite: {db_path}")
     print(f"Reporte CSV: {csv_path}")
-    if walk_errors:
-        print(f"Directorios no listados por error de permisos: {len(walk_errors)}")
-
-    conn.close()
-
+    if result.walk_errors:
+        print(
+            "Directorios no listados por error de permisos: "
+            f"{len(result.walk_errors)}"
+        )
 
 def run_sample_frames(
     target: Path,
