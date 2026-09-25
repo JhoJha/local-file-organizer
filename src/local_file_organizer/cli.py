@@ -1260,241 +1260,38 @@ def run_organize_preview(
     Only reads the catalog database and the local human decisions file, and
     writes ``reports/organization_plan.json``; never walks the filesystem or
     touches the scanned tree. A missing decisions file means no decisions.
+
+    NOTE: 'quiet' is currently ineffective in run_organize_preview and is
+    retained for CLI signature compatibility. The preview tree is always printed.
+    This is tracked as technical debt for a future milestone.
     """
-    from .organization_plan import (
-        DESTINATION_REVIEW_LOW_EVIDENCE,
-        DESTINATION_REVIEW_METADATA,
-        DESTINATION_REVIEW_REJECTED,
-        DESTINATION_REVIEW_SCAN,
-        DESTINATION_REVIEW_UNCERTAIN,
-        DESTINATION_SIN_PERSONAS,
-        build_organization_plan,
-        plan_counts,
-        write_plan_json,
+    from .organization_preview import (
+        CatalogEmptyError,
+        CatalogNotFoundError,
+        InvalidDecisionsError,
+        format_preview_report,
+        generate_organization_preview,
     )
 
-    if not db_path.exists():
-        print(
-            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    conn = database.connect(db_path)
     try:
-        count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
-    except Exception:
+        result = generate_organization_preview(
+            db_path=db_path,
+            plan_path=plan_path,
+            decisions_path=decisions_path,
+            show_files=show_files,
+        )
+    except (CatalogNotFoundError, CatalogEmptyError):
         print(
             f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
             file=sys.stderr,
         )
-        conn.close()
         raise SystemExit(1)
-    if (count_row[0] if count_row else 0) == 0:
-        print(
-            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
-            file=sys.stderr,
-        )
-        conn.close()
-        raise SystemExit(1)
-
-    try:
-        decisions = load_decisions(decisions_path)
-    except ValueError as exc:
-        conn.close()
+    except InvalidDecisionsError as exc:
         print(f"ERROR: decisiones inválidas: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
-    entries = build_organization_plan(conn, decisions=decisions)
-    counts = plan_counts(entries)
-    by_destination: dict[str, int] = counts["by_destination"]
-    write_plan_json(entries, plan_path)
-
-    paths_by_destination: dict[str, list[str]] = {}
-    if show_files:
-        rows = conn.execute(
-            "SELECT path FROM files WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
-        ).fetchall()
-        dest_by_index = [e["proposed_destination"] for e in entries]
-        if len(rows) != len(dest_by_index):
-            conn.close()
-            raise RuntimeError(
-                f"desincronización en organize-preview: {len(rows)} archivos activos pero {len(dest_by_index)} entradas de plan"
-            )
-        for row, dest in zip(rows, dest_by_index):
-            paths_by_destination.setdefault(dest, []).append(row["path"])
-    conn.close()
-
-    def _files_word(n: int) -> str:
-        return "1 archivo" if n == 1 else f"{n} archivos"
-
-    def _leaf_line(name: str, n: int) -> str:
-        return f"{name}  {_files_word(n)}"
-
-    lines = ["=== ORGANIZATION PREVIEW ===", ""]
-
-    media_dests = {d: c for d, c in by_destination.items() if d.startswith("Media/")}
-    if media_dests:
-        lines.append("Media/")
-        personas = sorted(
-            (d, c) for d, c in media_dests.items() if d.startswith("Media/Personas/")
-        )
-        parejas = sorted(
-            (d, c) for d, c in media_dests.items() if d.startswith("Media/Parejas/")
-        )
-        grupos = sorted(
-            (d, c) for d, c in media_dests.items() if d.startswith("Media/Grupos/")
-        )
-        sin = media_dests.get(DESTINATION_SIN_PERSONAS)
-        if personas:
-            lines.append("  Personas/")
-            for dest, c in personas:
-                label = dest.split("/")[2]
-                lines.append(f"    {label}/  {_files_word(c)}")
-                if show_files:
-                    for p in sorted(paths_by_destination.get(dest, [])):
-                        lines.append(f"      - {p}")
-        if parejas:
-            lines.append("  Parejas/")
-            for dest, c in parejas:
-                label = dest.split("/")[2]
-                lines.append(f"    {label}/  {_files_word(c)}")
-                if show_files:
-                    for p in sorted(paths_by_destination.get(dest, [])):
-                        lines.append(f"      - {p}")
-        if grupos:
-            lines.append("  Grupos/")
-            for dest, c in grupos:
-                label = dest.split("/")[2]
-                lines.append(f"    {label}/  {_files_word(c)}")
-                if show_files:
-                    for p in sorted(paths_by_destination.get(dest, [])):
-                        lines.append(f"      - {p}")
-        if sin:
-            lines.append(f"  {_leaf_line('Sin_personas/', sin)}")
-            if show_files:
-                for p in sorted(
-                    paths_by_destination.get(DESTINATION_SIN_PERSONAS, [])
-                ):
-                    lines.append(f"      - {p}")
-        lines.append("")
-
-    revision = {d: c for d, c in by_destination.items() if d.startswith("Revisión/")}
-    if revision:
-        lines.append("Revisión/")
-        for label, dest in (
-            ("Persona_incierta/", DESTINATION_REVIEW_UNCERTAIN),
-            ("Cluster_rechazado/", DESTINATION_REVIEW_REJECTED),
-            ("Baja_evidencia/", DESTINATION_REVIEW_LOW_EVIDENCE),
-            ("Metadata_incompleta/", DESTINATION_REVIEW_METADATA),
-            ("Errores_de_escaneo/", DESTINATION_REVIEW_SCAN),
-        ):
-            n = revision.get(dest)
-            if not n:
-                continue
-            lines.append(f"  {_leaf_line(label, n)}")
-            if show_files:
-                for p in sorted(paths_by_destination.get(dest, [])):
-                    lines.append(f"    - {p}")
-        lines.append("")
-
-    documentos = sorted(
-        (d, c) for d, c in by_destination.items() if d.startswith("Documentos/")
-    )
-    if documentos:
-        lines.append("Documentos/")
-        for dest, c in documentos:
-            label = dest.split("/")[1]
-            lines.append(f"  {_leaf_line(label + '/', c)}")
-            if show_files:
-                for p in sorted(paths_by_destination.get(dest, [])):
-                    lines.append(f"    - {p}")
-        lines.append("")
-
-    audios = sorted(
-        (d, c) for d, c in by_destination.items() if d.startswith("Audio/")
-    )
-    if audios:
-        lines.append("Audio/")
-        for dest, c in audios:
-            label = dest.split("/")[1]
-            lines.append(f"  {_leaf_line(label + '/', c)}")
-            if show_files:
-                for p in sorted(paths_by_destination.get(dest, [])):
-                    lines.append(f"    - {p}")
-        lines.append("")
-
-    if by_destination.get("Archivos_comprimidos/"):
-        n = by_destination["Archivos_comprimidos/"]
-        lines.append(f"Archivos_comprimidos/  {_files_word(n)}")
-        if show_files:
-            for p in sorted(paths_by_destination.get("Archivos_comprimidos/", [])):
-                lines.append(f"  - {p}")
-        lines.append("")
-
-    if by_destination.get("Software/"):
-        n = by_destination["Software/"]
-        lines.append(f"Software/  {_files_word(n)}")
-        if show_files:
-            for p in sorted(paths_by_destination.get("Software/", [])):
-                lines.append(f"  - {p}")
-        lines.append("")
-
-    otros = sorted(
-        (d, c) for d, c in by_destination.items() if d.startswith("Otros/")
-    )
-    if otros:
-        lines.append("Otros/")
-        for dest, c in otros:
-            label = dest.split("/")[1]
-            lines.append(f"  {_leaf_line(label + '/', c)}")
-            if show_files:
-                for p in sorted(paths_by_destination.get(dest, [])):
-                    lines.append(f"    - {p}")
-        lines.append("")
-
-    person_destinations = sum(
-        c for d, c in by_destination.items() if d.startswith("Media/Personas/")
-    )
-    pair_destinations = sum(
-        c for d, c in by_destination.items() if d.startswith("Media/Parejas/")
-    )
-    group_destinations = sum(
-        c for d, c in by_destination.items() if d.startswith("Media/Grupos/")
-    )
-    review_destinations = sum(
-        c for d, c in by_destination.items() if d.startswith("Revisión/")
-    )
-    sin_personas = by_destination.get(DESTINATION_SIN_PERSONAS, 0)
-
-    lines.append("FLAGS:")
-    lines.append(f"exact_duplicates={counts['exact_duplicates']}")
-    lines.append(f"visual_similar_groups={counts['visual_similar_groups']}")
-    lines.append("")
-    lines.append("=== DESTINATIONS ===")
-    lines.append(f"person_destinations={person_destinations}")
-    lines.append(f"pair_destinations={pair_destinations}")
-    lines.append(f"group_destinations={group_destinations}")
-    lines.append(f"review_destinations={review_destinations}")
-    lines.append(f"sin_personas={sin_personas}")
-    lines.append("")
-    lines.append("=== CONFIDENCE ===")
-    confidence = counts["confidence_levels"]
-    lines.append(f"high={confidence['high']}")
-    lines.append(f"medium={confidence['medium']}")
-    lines.append(f"low={confidence['low']}")
-    lines.append("")
-    lines.append("=== ACCOUNTING ===")
-    lines.append(f"catalog_files={counts['catalog_files']}")
-    lines.append(f"planned={counts['planned']}")
-    lines.append(f"review={counts['review']}")
-    lines.append(f"unsupported={counts['unsupported']}")
-    lines.append("")
-    lines.append("PREVIEW ONLY")
-    lines.append("moved=0")
-    lines.append("copied=0")
-    lines.append("renamed=0")
-    lines.append("deleted=0")
-    print("\n".join(lines))
+    report = format_preview_report(result, show_files=show_files)
+    print(report)
 
 
 def run_face_review(
