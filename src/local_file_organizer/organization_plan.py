@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import html
+import io
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any, Callable
+
+from PIL import Image
 
 from .face_review import (
     DECISION_CONFIRMED,
@@ -30,6 +34,7 @@ from .person_identity import (
     member_machine_labels,
     resolve_file_persons,
 )
+from .video_sampling import sample_video_frames
 
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_MEDIUM = "medium"
@@ -433,6 +438,131 @@ def write_plan_json(entries: list[dict], plan_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Viewer thumbnails (V1 derived local cache)
+# ---------------------------------------------------------------------------
+
+VIEW_ASSETS_DIR_NAME = "assets"
+VIEW_THUMBNAIL_MAX_PX = 256
+VIEW_THUMBNAIL_QUALITY = 85
+VIEW_VIDEO_FALLBACK_TIMESTAMP = 1.0
+
+
+def _write_view_thumbnail(image: Image.Image, destination: Path) -> int:
+    """Downscale (long edge ``VIEW_THUMBNAIL_MAX_PX``) and write a JPEG.
+
+    The JPEG is encoded in memory first, so a failed encode never leaves a
+    partial file behind. Returns the bytes written.
+    """
+    frame = image.convert("RGB")
+    frame.thumbnail((VIEW_THUMBNAIL_MAX_PX, VIEW_THUMBNAIL_MAX_PX))
+    buffer = io.BytesIO()
+    frame.save(buffer, format="JPEG", quality=VIEW_THUMBNAIL_QUALITY)
+    data = buffer.getvalue()
+    destination.write_bytes(data)
+    return len(data)
+
+
+def _write_video_view_thumbnail(
+    path: str,
+    file_id: str,
+    duration_seconds: float | None,
+    assets_dir: Path,
+    video_sampler: Callable,
+) -> bool:
+    """Sample one middle frame ephemerally and persist only its thumbnail.
+
+    Returns True when ``assets/<file_id>.jpg`` was written. Any failure
+    (missing ffmpeg, unknown duration, corrupt video, decode error) returns
+    False so the row renders a placeholder instead of a broken image.
+    """
+    if duration_seconds is not None and duration_seconds > 0:
+        timestamp = duration_seconds / 2.0
+    else:
+        timestamp = VIEW_VIDEO_FALLBACK_TIMESTAMP
+    destination = assets_dir / f"{file_id}.jpg"
+    written = False
+
+    def _on_frame(frame_path: Path, _timestamp: float, _index: int) -> None:
+        nonlocal written
+        if written:
+            return
+        with Image.open(frame_path) as handle:
+            image = handle.convert("RGB")
+        _write_view_thumbnail(image, destination)
+        written = True
+
+    try:
+        result = video_sampler(
+            Path(path),
+            [timestamp],
+            on_frame=_on_frame,
+            keep_debug_frames=False,
+        )
+    except Exception:  # noqa: BLE001 - one bad video never aborts the run
+        result = None
+        written = False
+    if result is None or result.video_error is not None or not written:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def generate_plan_view_thumbnails(
+    sources_by_file_id: dict[str, dict[str, Any]],
+    assets_dir: Path,
+    *,
+    video_sampler: Callable = sample_video_frames,
+) -> dict[str, str]:
+    """Render one JPEG thumbnail per image/video source under ``assets_dir``.
+
+    ``sources_by_file_id`` maps opaque ``F000NNN`` ids to ``{"path",
+    "category", "duration_seconds"}`` (used only to read image bytes or to
+    pick the middle video frame; never serialized). Files are decoded into
+    memory and written as opaque ``F000NNN.jpg`` files directly under
+    ``assets_dir`` — nothing is ever written inside the scanned tree. Rows
+    whose category is not image/video, or whose thumbnail fails for any
+    reason, are simply absent from the result so the viewer can render a
+    placeholder cell instead of a broken image.
+
+    Returns the mapping ``file_id -> "assets/F000NNN.jpg"`` (relative src
+    for the ``<img>`` tags, opaque ids only).
+    """
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    thumbs: dict[str, str] = {}
+    for file_id in sorted(sources_by_file_id):
+        source = sources_by_file_id[file_id]
+        category = source.get("category")
+        if category not in ("image", "video"):
+            continue
+        destination = assets_dir / f"{file_id}.jpg"
+        try:
+            if category == "image":
+                with Image.open(source["path"]) as handle:
+                    image = handle.convert("RGB")
+                _write_view_thumbnail(image, destination)
+            else:
+                if not _write_video_view_thumbnail(
+                    source["path"],
+                    file_id,
+                    source.get("duration_seconds"),
+                    assets_dir,
+                    video_sampler,
+                ):
+                    continue
+        except Exception:  # noqa: BLE001 - one bad file never aborts the run
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        thumbs[file_id] = f"{VIEW_ASSETS_DIR_NAME}/{file_id}.jpg"
+    return thumbs
+
+
+# ---------------------------------------------------------------------------
 # Static offline plan viewer (T1)
 # ---------------------------------------------------------------------------
 
@@ -450,6 +580,7 @@ def build_plan_view_rows(
     entries: list[dict],
     persons_by_file_id: dict[str, list[str]] | None = None,
     paths_by_file_id: dict[str, str] | None = None,
+    thumbs_by_file_id: dict[str, str] | None = None,
 ) -> list[dict]:
     """Derive viewer rows from plan entries plus optional overlays.
 
@@ -459,9 +590,12 @@ def build_plan_view_rows(
     the catalog at preview time), and ``path`` is only attached when the
     caller explicitly passes ``paths_by_file_id`` (manual ``--show-files``
     runs). With both overlays omitted the rows contain no personal data
-    beyond opaque ids and proposed destinations.
+    beyond opaque ids and proposed destinations. ``thumbs_by_file_id`` maps
+    opaque ids to relative ``assets/F000NNN.jpg`` sources (no image bytes,
+    no real paths); rows without a thumb render a placeholder cell.
     """
     persons_by_file_id = persons_by_file_id or {}
+    thumbs_by_file_id = thumbs_by_file_id or {}
     rows = []
     for entry in entries:
         file_id = entry["file_id"]
@@ -478,6 +612,7 @@ def build_plan_view_rows(
                 "flags": list(entry["flags"]),
                 "reasons": list(entry["reason_codes"]),
                 "path": path,
+                "thumbnail": thumbs_by_file_id.get(file_id),
             }
         )
     return rows
@@ -517,6 +652,12 @@ thead th { background: #ececec; position: sticky; top: 0; }
 td.id { font-family: monospace; white-space: nowrap; }
 td.dest { font-family: monospace; }
 td.reasons { font-family: monospace; color: #444; }
+td.thumb { width: 104px; }
+td.thumb img {
+  display: block; max-width: 96px; max-height: 96px;
+  border: 1px solid #ccc; border-radius: 4px; background: #eee;
+}
+.no-thumb { color: #999; }
 """
 
 _VIEW_JS = """
@@ -608,7 +749,17 @@ def _render_view_rows(rows: list[dict], include_paths: bool) -> str:
         persons_cell = ", ".join(persons) if persons else "-"
         flags_cell = ", ".join(row["flags"]) if row["flags"] else "-"
         reasons_cell = ", ".join(row["reasons"]) if row["reasons"] else "-"
+        thumb_src = row.get("thumbnail")
+        if thumb_src:
+            thumb_cell = (
+                f'<td class="thumb"><img src="{html.escape(thumb_src)}" '
+                f'loading="lazy" alt="{html.escape(row["file_id"])} preview">'
+                "</td>"
+            )
+        else:
+            thumb_cell = '<td class="thumb"><span class="no-thumb">-</span></td>'
         cells = (
+            f"{thumb_cell}"
             f'<td class="id">{html.escape(row["file_id"])}</td>'
             f"<td>{html.escape(row['category'])}</td>"
             f'<td class="dest">{html.escape(row["destination"])}</td>'
@@ -653,6 +804,7 @@ def render_plan_view_html(
     counts: dict,
     persons_by_file_id: dict[str, list[str]] | None = None,
     paths_by_file_id: dict[str, str] | None = None,
+    thumbs_by_file_id: dict[str, str] | None = None,
 ) -> str:
     """Render the fully static, offline plan viewer page (deterministic).
 
@@ -660,12 +812,16 @@ def render_plan_view_html(
     no network calls: filtering runs locally in the browser over the rows
     rendered into the table. Real paths only appear when the caller passes
     ``paths_by_file_id`` (manual ``--show-files`` runs); otherwise the page
-    holds opaque ``F000NNN`` ids only.
+    holds opaque ``F000NNN`` ids only. Thumbnails are referenced by opaque
+    ``assets/F000NNN.jpg`` sources only; rows without a thumbnail show a
+    placeholder cell, never a broken image.
     """
-    rows = build_plan_view_rows(entries, persons_by_file_id, paths_by_file_id)
+    rows = build_plan_view_rows(
+        entries, persons_by_file_id, paths_by_file_id, thumbs_by_file_id
+    )
     include_paths = paths_by_file_id is not None
     headers = (
-        "<th>File</th><th>Category</th><th>Destination</th>"
+        "<th>Preview</th><th>File</th><th>Category</th><th>Destination</th>"
         "<th>Confidence</th><th>Persons</th><th>Flags</th><th>Reasons</th>"
     )
     if include_paths:
@@ -708,14 +864,36 @@ def write_plan_view_site(
     output_dir: Path,
     persons_by_file_id: dict[str, list[str]] | None = None,
     paths_by_file_id: dict[str, str] | None = None,
+    sources_by_file_id: dict[str, dict[str, Any]] | None = None,
+    video_sampler: Callable = sample_video_frames,
 ) -> Path:
-    """Write ``index.html`` (the offline plan viewer) under ``output_dir``."""
+    """Write ``index.html`` (the offline plan viewer) under ``output_dir``.
+
+    When ``sources_by_file_id`` maps opaque ``F000NNN`` ids to ``{"path",
+    "category", "duration_seconds"}``, one JPEG thumbnail per image/video
+    row is rendered into ``output_dir/assets/`` (opaque ``F000NNN.jpg``
+    names) and referenced from the table; the sources themselves are never
+    serialized. Thumbnails are a derived local cache like the face-review
+    assets: only ``output_dir`` is ever written, never the scanned tree,
+    and the plan JSON schema is untouched.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    thumbs_by_file_id: dict[str, str] = {}
+    if sources_by_file_id:
+        thumbs_by_file_id = generate_plan_view_thumbnails(
+            sources_by_file_id,
+            output_dir / VIEW_ASSETS_DIR_NAME,
+            video_sampler=video_sampler,
+        )
     index_path = output_dir / VIEW_INDEX_FILENAME
     with open(index_path, "w", encoding="utf-8") as handle:
         handle.write(
             render_plan_view_html(
-                entries, counts, persons_by_file_id, paths_by_file_id
+                entries,
+                counts,
+                persons_by_file_id,
+                paths_by_file_id,
+                thumbs_by_file_id,
             )
         )
     return index_path

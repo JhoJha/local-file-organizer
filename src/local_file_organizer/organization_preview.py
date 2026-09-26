@@ -71,7 +71,11 @@ def generate_organization_preview(
 
     This function is strictly read-only on the catalog database and decisions file,
     and only writes the output plan JSON to `plan_path` plus the static offline
-    viewer (`index.html`) under `view_dir` (default: `<plan_dir>/organization_view`).
+    viewer (`index.html` with an `assets/` thumbnail cache) under `view_dir`
+    (default: `<plan_dir>/organization_view`). Image rows get a downscaled
+    JPEG thumbnail and video rows a middle-frame thumbnail (opaque
+    `F000NNN.jpg` names, derived local cache only); rows without a thumbnail
+    render a placeholder. Source files are only ever read, never written.
     Pass `write_view=False` to skip the viewer. Real paths are embedded in the
     viewer only when `show_files` is true (explicit manual runs); otherwise the
     viewer holds opaque file ids only. It produces no stdout/stderr
@@ -109,9 +113,11 @@ def generate_organization_preview(
         paths_by_destination: dict[str, list[str]] = {}
         persons_by_file_id: dict[str, list[str]] = {}
         paths_by_file_id: dict[str, str] | None = None
+        sources_by_file_id: dict[str, dict[str, Any]] = {}
         if show_files or write_view:
             rows = conn.execute(
-                "SELECT path FROM files WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
+                "SELECT path, category, duration_seconds FROM files "
+                "WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
             ).fetchall()
             dest_by_index = [e["proposed_destination"] for e in entries]
             aligned = len(rows) == len(dest_by_index)
@@ -125,6 +131,12 @@ def generate_organization_preview(
                     persons = sorted(person_sets.get(row["path"], ()))
                     if persons:
                         persons_by_file_id[entry["file_id"]] = persons
+                    if row["category"] in ("image", "video"):
+                        sources_by_file_id[entry["file_id"]] = {
+                            "path": row["path"],
+                            "category": row["category"],
+                            "duration_seconds": row["duration_seconds"],
+                        }
                 if show_files:
                     paths_by_file_id = {
                         entry["file_id"]: row["path"]
@@ -144,6 +156,7 @@ def generate_organization_preview(
                 resolved_view_dir,
                 persons_by_file_id=persons_by_file_id,
                 paths_by_file_id=paths_by_file_id,
+                sources_by_file_id=sources_by_file_id,
             )
 
         return PreviewResult(
