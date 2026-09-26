@@ -412,6 +412,7 @@ def _preflight_moves(
     """
     moves: list[PlannedMove] = []
     skipped_identical: list[str] = []
+    seen: set[Path] = set()
     missing: list[str] = []
     wrong_type: list[str] = []
     outside: list[str] = []
@@ -427,6 +428,9 @@ def _preflight_moves(
         )
         if src == dst:
             continue  # Already in place: nothing to do.
+        if dst in seen:
+            collisions.append(file_id)
+            continue
         if not os.path.lexists(src):
             missing.append(file_id)
             continue
@@ -449,6 +453,7 @@ def _preflight_moves(
                 continue
             collisions.append(file_id)
             continue
+        seen.add(dst)
         moves.append(
             PlannedMove(
                 file_id=file_id,

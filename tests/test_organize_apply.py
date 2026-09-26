@@ -268,6 +268,38 @@ class OrganizeApplyTests(unittest.TestCase):
         self.assertEqual(self.tree.contents(), before)
         self.assertFalse(self.tree.manifest_path.exists())
 
+    def test_intra_run_duplicate_destination_is_refused(self):
+        _write(self.tree.target / "sub_a" / "dup.pdf", b"first-bytes")
+        _write(self.tree.target / "sub_b" / "dup.pdf", b"second-bytes")
+        conn = database.connect(self.tree.db_path)
+        try:
+            for sub in ("sub_a", "sub_b"):
+                database.upsert_file(
+                    conn,
+                    database.FileRecord(
+                        path=str(self.tree.target / sub / "dup.pdf"),
+                        name="dup.pdf",
+                        extension=".pdf",
+                        category="document",
+                        scan_status="ok",
+                        metadata_status="skipped",
+                        file_state="active",
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        generate_organization_preview(
+            db_path=self.tree.db_path,
+            plan_path=self.tree.plan_path,
+            write_view=False,
+        )
+        before = self.tree.contents()
+        with self.assertRaises(apply_mod.CollisionError):
+            self._apply()
+        self.assertEqual(self.tree.contents(), before)
+        self.assertFalse(self.tree.manifest_path.exists())
+
     def test_symlink_destination_is_never_overwritten(self):
         dst = self.tree.target / "Documentos" / "PDF" / "doc.pdf"
         dst.parent.mkdir(parents=True, exist_ok=True)
