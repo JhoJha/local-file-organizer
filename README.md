@@ -797,7 +797,8 @@ defecto nunca contiene rutas).
 
 ```text
 reports/organization_view/
-└── index.html          # static page, inline CSS/JS, no remote resources
+├── index.html          # static page, inline CSS/JS, no remote resources
+└── assets/             # derived thumbnail cache (F000NNN.jpg, opaque names)
 ```
 
 Open `reports/organization_view/index.html` in a browser to browse every
@@ -805,6 +806,15 @@ plan entry (`F000NNN` id, category, destination, confidence, persons,
 flags, reasons) and filter it by destination, person (`P000N` /
 `PERSON_XXXX`) and confidence (`high` / `medium` / `low`). All filtering
 runs locally in the page; the viewer makes no network calls.
+
+Every image row shows a downscaled JPEG thumbnail (long edge 256px) and
+every video row a middle-frame thumbnail, stored as opaque
+`assets/F000NNN.jpg` files. Rows without a thumbnail (other categories or
+unreadable files) show a placeholder, never a broken image. Thumbnails are
+a derived local cache like `reports/face_review/assets/`: they contain
+image content by design, live only under the view directory (never inside
+the scanned tree), hold no real paths, and can be regenerated at any time
+by re-running `organize-preview`.
 
 Privacy: the viewer holds opaque ids only — no real paths — unless you
 pass `--show-files` (explicit manual runs), which adds a path column.

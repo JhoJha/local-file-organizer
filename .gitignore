@@ -17,6 +17,9 @@ data/debug_frames/
 reports/face_review/
 data/face_review_decisions.json
 
+# Organization plan viewer: static page plus derived thumbnail cache.
+reports/organization_view/
+
 __pycache__/
 *.pyc
 .pytest_cache/
