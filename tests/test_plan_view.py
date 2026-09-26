@@ -114,6 +114,7 @@ class ViewerEmissionTests(PlanViewTestBase):
                     "flags",
                     "confidence_level",
                     "action",
+                    "src_hash",
                 },
             )
 

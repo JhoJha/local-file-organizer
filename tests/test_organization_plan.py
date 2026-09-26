@@ -634,7 +634,7 @@ class OrganizationPlanTests(unittest.TestCase):
             self.assertEqual(
                 set(entry.keys()),
                 {"file_id", "category", "bucket", "proposed_destination",
-                 "reason_codes", "flags", "confidence_level", "action"})
+                 "reason_codes", "flags", "confidence_level", "action", "src_hash"})
             self.assertNotIn("path", entry)
             self.assertNotIn("confidence", entry)
             self.assertEqual(entry["action"], "preview_only")

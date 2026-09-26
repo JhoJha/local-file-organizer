@@ -314,6 +314,36 @@ class OrganizeApplyTests(unittest.TestCase):
         with self.assertRaises(apply_mod.PlanDesyncError):
             self._apply()
 
+    def test_same_count_path_swap_is_refused(self):
+        conn = database.connect(self.tree.db_path)
+        try:
+            old = conn.execute(
+                "SELECT path FROM files ORDER BY path LIMIT 1").fetchone()["path"]
+            conn.execute("UPDATE files SET path = ? WHERE path = ?",
+                         (old + ".swapped", old))
+            conn.commit()
+        finally:
+            conn.close()
+        before = self.tree.contents()
+        with self.assertRaises(apply_mod.PlanDesyncError):
+            self._apply()
+        self.assertEqual(self.tree.contents(), before)
+
+    def test_after_snapshot_failure_keeps_complete_manifest(self):
+        real_save = apply_mod.save_snapshot
+        def flaky(snapshot, path):
+            if path.name.startswith("apply_after_"):
+                raise OSError("snapshot disk full")
+            return real_save(snapshot, path)
+        apply_mod.save_snapshot = flaky
+        try:
+            result = self._apply()
+        finally:
+            apply_mod.save_snapshot = real_save
+        payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(len(payload["entries"]), len(result.moved))
+
     def test_outputs_inside_target_are_refused(self):
         with self.assertRaises(apply_mod.UnsafeOutputError):
             self._apply(snapshot_dir=self.tree.target / "snaps")

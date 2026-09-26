@@ -23,6 +23,7 @@ exceptions and returns structured results. CLI printing lives in
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -236,6 +237,12 @@ def resolve_source_paths(
                 f"plan desync: entry {index} has id {entry['file_id']!r}, "
                 f"expected {expected!r}; regenerate the plan with "
                 f"organize-preview before applying"
+            )
+        want = hashlib.sha256(row["path"].encode("utf-8")).hexdigest()
+        if entry.get("src_hash") != want:
+            raise PlanDesyncError(
+                f"plan desync: source mismatch for {entry['file_id']!r}; "
+                f"regenerate the plan with organize-preview before applying"
             )
         mapping[entry["file_id"]] = row["path"]
     return mapping
@@ -582,9 +589,9 @@ def run_apply(
     """Execute the planned moves (real run: the caller confirmed ``--apply``).
 
     Order: structural checks -> full hashing pre-flight (refuses without
-    moving anything) -> before snapshot -> moves -> after snapshot ->
-    manifest. A mid-run failure still writes a partial manifest so the
-    completed moves stay undoable, then raises ``ApplyInterruptedError``.
+    moving anything) -> before snapshot -> moves -> manifest -> after
+    snapshot (best-effort proof). A mid-run failure still writes a partial
+    manifest so the completed moves stay undoable, then raises ``ApplyInterruptedError``.
     """
     stamp = timestamp or _utc_timestamp()
     resolved, movable, skipped_review = _resolve_plan(
@@ -623,8 +630,11 @@ def run_apply(
             partial,
         ) from exc
 
-    save_snapshot(capture_snapshot(resolved.target_root), after_path)
     write_manifest(manifest, resolved.target_root, include_review, completed, "complete")
+    try:
+        save_snapshot(capture_snapshot(resolved.target_root), after_path)
+    except OSError:
+        pass  # Snapshot is proof; the manifest above already keeps undo.
     return ApplyResult(
         target_root=resolved.target_root,
         moved=tuple(completed),

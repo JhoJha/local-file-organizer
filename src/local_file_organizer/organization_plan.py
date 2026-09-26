@@ -14,6 +14,7 @@ to prefer a false negative (route to ``Revisión/``) over a false positive
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import sqlite3
@@ -418,6 +419,7 @@ def build_organization_plan(
                 "flags": flags,
                 "confidence_level": confidence_level,
                 "action": "preview_only",
+                "src_hash": hashlib.sha256(path.encode("utf-8")).hexdigest(),
             }
         )
     return entries

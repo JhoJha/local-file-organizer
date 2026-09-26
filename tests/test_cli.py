@@ -1145,7 +1145,7 @@ class OrganizePreviewCliTests(unittest.TestCase):
             self.assertEqual(
                 set(entry.keys()),
                 {"file_id", "category", "bucket", "proposed_destination",
-                 "reason_codes", "flags", "confidence_level", "action"})
+                 "reason_codes", "flags", "confidence_level", "action", "src_hash"})
             self.assertNotIn("confidence", entry)
         serialized = self.plan_path.read_text(encoding="utf-8")
         for secret in secrets:
