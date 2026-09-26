@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 
@@ -32,7 +32,7 @@ from .face_detection import (
     detect_faces_in_image_file,
     detect_faces_raw,
 )
-from .exiftool import EXIFTOOL_VERSION, exiftool_available, get_exif_metadata
+from .exiftool import exiftool_available, get_exif_metadata
 from .face_embedding import compute_embedding
 from .face_review import (
     DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
@@ -46,9 +46,8 @@ from .face_review import (
     validate_decisions,
     write_review_site,
 )
-from .hashing import DuplicateRecord, find_duplicates
+from .hashing import find_duplicates
 from .metadata import (
-    FFPROBE_VERSION,
     get_basic_metadata,
     get_video_metadata,
     human_readable_size,
@@ -56,15 +55,20 @@ from .metadata import (
 from .video_sampling import compute_sample_timestamps, sample_video_frames
 from .perceptual_hash import (
     DEFAULT_SIMILARITY_THRESHOLD,
-    DHASH_VERSION,
-    SimilarityRecord,
     get_image_metadata,
-    group_similar_images,
     hamming_distance,
 )
-from .reporting import build_summary_text, export_csv
+from .reporting import build_summary_text
 from .scanner import DEFAULT_IGNORED_DIRS, ScanError, iter_files
 from .snapshot import capture_snapshot, diff_snapshots, save_snapshot
+from .scan_workflow import (
+    TargetNotDirectoryError,
+    TargetNotFoundError,
+    fingerprint_match,
+    generate_scan,
+    required_versions,
+    scan_one_file,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "catalog.sqlite"
@@ -87,125 +91,31 @@ def _display_path(path: Path) -> str:
 
 
 def _required_versions(category: str, exif_enabled: bool) -> set[str]:
-    """Extractor versions a scan would run for this category (F1).
-
-    'other' needs nothing beyond stat+classify, so a fingerprinted
-    'other' file always skips. Versions are only recorded on success
-    (see _scan_one_file), so failed extractions are retried next scan.
-    """
-    required: set[str] = set()
-    if category == "image":
-        required.add(DHASH_VERSION)
-    elif category == "video":
-        required.add(FFPROBE_VERSION)
-    if exif_enabled and category in ("image", "video"):
-        required.add(EXIFTOOL_VERSION)
-    return required
+    """Compatibility wrapper delegating to scan_workflow.required_versions."""
+    return required_versions(category, exif_enabled)
 
 
 def _fingerprint_match(
-    stored: Optional[dict], basic, exif_enabled: bool
+    stored: Optional[dict], basic: Any, exif_enabled: bool
 ) -> bool:
-    """True when the catalog row is fresh: same bytes (size+mtime) and
-    the stored extractor versions cover everything this scan would run.
-    """
-    if not stored:
-        return False
-    if stored.get("size_bytes") != basic.size_bytes:
-        return False
-    if stored.get("modified_at") != basic.modified_at:
-        return False
-    stored_versions = set((stored.get("extractor_versions") or "").split("|")) - {""}
-    return _required_versions(basic.category, exif_enabled) <= stored_versions
+    """Compatibility wrapper delegating to scan_workflow.fingerprint_match."""
+    return fingerprint_match(stored, basic, exif_enabled)
 
 
 def _scan_one_file(
-    path: Path, enable_exif: bool = True, known_basic=None
+    path: Path, enable_exif: bool = True, known_basic: Any = None
 ) -> database.FileRecord:
-    if known_basic is None:
-        try:
-            basic = get_basic_metadata(path)
-        except OSError as exc:
-            return database.FileRecord(
-                path=str(path),
-                name=path.name,
-                extension=path.suffix.lower(),
-                category=classify(path.suffix),
-                scan_status="error",
-                scan_error=str(exc),
-            )
-    else:
-        basic = known_basic
-
-    record = database.FileRecord(
-        path=basic.path,
-        name=basic.name,
-        extension=basic.extension,
-        category=basic.category,
-        size_bytes=basic.size_bytes,
-        modified_at=basic.modified_at,
-        mime_type=basic.mime_type,
-        scan_status="ok",
-        scan_error=None,
+    """Compatibility wrapper delegating to scan_workflow.scan_one_file with CLI module bindings."""
+    return scan_one_file(
+        path,
+        enable_exif=enable_exif,
+        known_basic=known_basic,
+        get_basic_metadata_fn=get_basic_metadata,
+        get_image_metadata_fn=get_image_metadata,
+        get_video_metadata_fn=get_video_metadata,
+        get_exif_metadata_fn=get_exif_metadata,
+        classify_fn=classify,
     )
-
-    if basic.category == "video":
-        video = get_video_metadata(path)
-        record.duration_seconds = video.duration_seconds
-        record.width = video.width
-        record.height = video.height
-        record.fps = video.fps
-        record.video_codec = video.video_codec
-        record.audio_codec = video.audio_codec
-        record.bitrate = video.bitrate
-        if video.error:
-            record.metadata_status = "error"
-            record.metadata_error = video.error
-        else:
-            record.metadata_status = "ok"
-    elif basic.category == "image":
-        image = get_image_metadata(path)
-        if image.error:
-            record.metadata_status = "error"
-            record.metadata_error = image.error
-        else:
-            record.metadata_status = "ok"
-            record.perceptual_hash = image.perceptual_hash
-            record.similarity_method = image.similarity_method
-    # Other categories have no specialized extraction yet in V1, so
-    # metadata_status keeps its "skipped" default.
-
-    # V3.0 EXIF/XMP enrichment for stills and video (QuickTime tags).
-    # Pure enrichment: it only fills columns, it never flips
-    # metadata_status — a file without EXIF is "unknown", not an error.
-    exif_ok = False
-    if enable_exif and basic.category in ("image", "video"):
-        exif = get_exif_metadata(path)
-        if exif.error is None:
-            exif_ok = True
-            record.capture_date = exif.capture_date
-            record.device_make = exif.device_make
-            record.device_model = exif.device_model
-            record.device_software = exif.device_software
-            record.gps_latitude = exif.gps_latitude
-            record.gps_longitude = exif.gps_longitude
-            record.gps_altitude = exif.gps_altitude
-            record.orientation = exif.orientation
-
-    # F1 incrementality: record which extractors succeeded. Failed ones
-    # are omitted so the next scan retries them; a newly appeared binary
-    # (e.g. exiftool installed later) triggers reprocessing via the
-    # required-vs-stored subset check in _fingerprint_match.
-    versions: set[str] = set()
-    if basic.category == "image" and record.metadata_status == "ok":
-        versions.add(DHASH_VERSION)
-    if basic.category == "video" and record.metadata_status == "ok":
-        versions.add(FFPROBE_VERSION)
-    if exif_ok:
-        versions.add(EXIFTOOL_VERSION)
-    record.extractor_versions = "|".join(sorted(versions)) or None
-
-    return record
 
 
 def run_scan(
@@ -220,12 +130,6 @@ def run_scan(
     full: bool = False,
 ) -> None:
     """CLI adapter for the reusable scan application workflow."""
-    from .scan_workflow import (
-        TargetNotDirectoryError,
-        TargetNotFoundError,
-        generate_scan,
-    )
-
     ignored_dirs = set(DEFAULT_IGNORED_DIRS)
     if extra_ignored_dirs:
         ignored_dirs.update(extra_ignored_dirs)

@@ -9,14 +9,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from local_file_organizer import database
-from local_file_organizer.cli import _fingerprint_match, _scan_one_file
 from local_file_organizer.hashing import find_duplicates
 from local_file_organizer.metadata import get_basic_metadata
 from local_file_organizer.scan_workflow import (
     ScanResult,
     TargetNotDirectoryError,
     TargetNotFoundError,
+    fingerprint_match,
     generate_scan,
+    scan_one_file,
 )
 from local_file_organizer.scanner import DEFAULT_IGNORED_DIRS, iter_files
 
@@ -44,14 +45,26 @@ class ScanWorkflowTests(unittest.TestCase):
             "progress_interval": 500,
             "iter_files_fn": iter_files,
             "get_basic_metadata_fn": get_basic_metadata,
-            "scan_one_file_fn": _scan_one_file,
-            "fingerprint_match_fn": _fingerprint_match,
+            "scan_one_file_fn": scan_one_file,
+            "fingerprint_match_fn": fingerprint_match,
             "exiftool_available_fn": lambda: False,
             "find_duplicates_fn": find_duplicates,
             "now_iso_fn": lambda: "2026-09-25T21:00:00+00:00",
         }
         kwargs.update(overrides)
         return generate_scan(**kwargs)
+
+    def test_generate_scan_with_defaults_is_autonomous(self):
+        (self.root / "doc.txt").write_text("content", encoding="utf-8")
+        result = generate_scan(
+            target=self.root,
+            db_path=self.db,
+            csv_path=self.csv,
+        )
+        self.assertIsInstance(result, ScanResult)
+        self.assertTrue(self.db.exists())
+        self.assertTrue(self.csv.exists())
+        self.assertIn("1 archivos", result.summary)
 
     def test_returns_structured_result_without_console_output(self):
         (self.root / "a.txt").write_text("hello", encoding="utf-8")
