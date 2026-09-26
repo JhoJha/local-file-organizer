@@ -594,6 +594,7 @@ python -m local_file_organizer person-rename P0003 --name Pedro
 python -m local_file_organizer person-assign /ruta/video.mp4 PERSON_0007
 python -m local_file_organizer person-unassign /ruta/foto.jpg PERSON_0007
 python -m local_file_organizer person-split P0001 --files /ruta/a.jpg --name Otro
+python -m local_file_organizer person-suggest /ruta/a/analizar
 ```
 
 Reglas: sin curación todo resuelve igual que en V2.5 (`P0001` → `P0001`);
@@ -604,7 +605,10 @@ las decisiones de `face-review` sobre miembros se heredan de forma
 conservadora (`rejected`/`uncertain` ganan a `confirmed`);
 `organize-preview` ya enruta por canónicas (`Media/Personas/PERSON_0007/`)
 y manda la evidencia débil a `Revisión/`. No hay auto-merge: solo estos
-comandos explícitos fusionan.
+comandos explícitos fusionan. `person-suggest` re-ejecuta el mismo
+pipeline de embeddings que `cluster-people` (solo memoria) y lista
+pares en la banda `[0.40, 0.50)` de similitud centroide con evidencia
+(similitud, observaciones, archivos y el `person-merge` exacto).
 
 ## Búsqueda estructurada (V3.2)
 

@@ -20,6 +20,11 @@ import cv2
 
 from . import database
 from . import person_identity
+from .person_suggest import (
+    DEFAULT_MERGE_FLOOR_SIMILARITY,
+    SUGGEST_SIMILARITY_METRIC,
+    suggest_merges,
+)
 from . import user_tags
 from .classifier import classify
 from .face_clustering import assign_person_labels, cluster_people
@@ -881,6 +886,151 @@ def run_cluster_people(
         print(f"Directorios no listados por error de permisos: {len(walk_errors)}")
 
     conn.close()
+
+
+def run_person_suggest(
+    target: Path,
+    similarity_threshold: float = DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+    merge_floor: float = DEFAULT_MERGE_FLOOR_SIMILARITY,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
+    max_video_samples: int = 30,
+    quiet: bool = False,
+) -> None:
+    """Suggest merge candidates between person clusters (S2, read-only).
+
+    Recomputes embeddings through the same detection/embedding/tracklet
+    path as `run_cluster_people` (memory-only, never persisted), rebuilds
+    the clusters at `similarity_threshold`, then lists pairs whose
+    centroid cosine similarity falls in [merge_floor, split threshold)
+    with evidence. Suggestions only: nothing is merged or written; the
+    user confirms with `person-merge`.
+    """
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    if not 0.0 <= merge_floor < similarity_threshold <= 1.0:
+        print(
+            "ERROR: se requiere 0 <= merge-floor < similarity-threshold <= 1.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    observations: list[ClusterableObservation] = []
+    file_of_obs: list[tuple[str, str]] = []
+
+    for file_path in iter_files(target, ignored_dirs=set(DEFAULT_IGNORED_DIRS)):
+        category = classify(file_path.suffix)
+        if category == "image":
+            try:
+                _w, _h, rows, error = detect_faces_raw(
+                    file_path, confidence_threshold=confidence_threshold
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad image never aborts the run
+                if not quiet:
+                    print(f"Suggest {file_path}: error: {exc}")
+                continue
+            if error is not None or rows is None:
+                continue
+            img = cv2.imread(str(file_path))
+            for row in rows:
+                w, h = round(float(row[2])), round(float(row[3]))
+                if w < min_face_size or h < min_face_size or img is None:
+                    continue
+                emb = compute_embedding(img, row)
+                if emb is None:
+                    continue
+                observations.append(
+                    ClusterableObservation(
+                        key=(str(file_path), "image", -1, max(0, round(float(row[0])))),
+                        embedding=emb,
+                    )
+                )
+                file_of_obs.append((str(file_path), "image"))
+        elif category == "video":
+            try:
+                video_meta = get_video_metadata(file_path)
+                if video_meta.error or video_meta.duration_seconds is None:
+                    continue
+                timestamps = compute_sample_timestamps(
+                    video_meta.duration_seconds, max_video_samples
+                )
+                frame_detections: list[FrameFace] = []
+
+                def _on_frame(frame_path: Path, timestamp: float, _idx: int) -> None:
+                    _fw, _fh, frows, ferror = detect_faces_raw(
+                        frame_path, confidence_threshold=confidence_threshold
+                    )
+                    if ferror is not None or frows is None:
+                        return
+                    frame_img = cv2.imread(str(frame_path))
+                    if frame_img is None:
+                        return
+                    for frow in frows:
+                        w, h = round(float(frow[2])), round(float(frow[3]))
+                        if w < min_face_size or h < min_face_size:
+                            continue
+                        emb = compute_embedding(frame_img, frow)
+                        if emb is None:
+                            continue
+                        frame_detections.append(
+                            FrameFace(
+                                timestamp_ms=timestamp * 1000,
+                                bbox=(max(0, round(float(frow[0]))), round(float(frow[1])), w, h),
+                                embedding=emb,
+                                confidence=float(frow[14]),
+                            )
+                        )
+
+                sampling = sample_video_frames(
+                    file_path, timestamps, on_frame=_on_frame, keep_debug_frames=False
+                )
+                if sampling.video_error is not None:
+                    continue
+                for tracklet in build_tracklets(
+                    frame_detections, frame_ms=[ts * 1000 for ts in timestamps]
+                ):
+                    rep = tracklet.representative_member()
+                    observations.append(
+                        ClusterableObservation(
+                            key=(str(file_path), "video_frame", rep.timestamp_ms, rep.bbox[0]),
+                            embedding=tracklet.representative_embedding(),
+                        )
+                    )
+                    file_of_obs.append((str(file_path), "video"))
+            except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
+                if not quiet:
+                    print(f"Suggest {file_path}: error: {exc}")
+                continue
+
+    clusters = cluster_people(observations, threshold=1.0 - similarity_threshold)
+    labels = assign_person_labels(clusters)
+    candidates = suggest_merges(
+        observations,
+        clusters,
+        labels,
+        file_of_obs,
+        split_threshold=similarity_threshold,
+        merge_floor=merge_floor,
+    )
+
+    print()
+    print("=== PERSON SUGGESTIONS ===")
+    print(f"metric={SUGGEST_SIMILARITY_METRIC} band=[{merge_floor:.2f},{similarity_threshold:.2f})")
+    for candidate in candidates:
+        print(
+            f"{candidate.label_a} {candidate.label_b} "
+            f"similarity={candidate.mean_similarity:.3f} "
+            f"obs={candidate.obs_a}/{candidate.obs_b} "
+            f"files={candidate.files_a}/{candidate.files_b}"
+        )
+        print(f"  {candidate.merge_command()}")
+    print(f"suggestions={len(candidates)}")
+    if candidates:
+        print("Suggestions only - no changes made. Confirm with person-merge.")
 
 
 def _require_catalog(conn, db_path: Path) -> None:
@@ -1990,6 +2140,36 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     split_parser.add_argument("--name", default=None, help="Nombre para mostrar.")
 
+    suggest_parser = subparsers.add_parser(
+        "person-suggest",
+        help="List merge candidates between person clusters (suggestions only).",
+    )
+    suggest_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    suggest_parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+        help=(
+            "Split threshold reused from cluster-people: pairs at or above "
+            "it are already one cluster and never suggested."
+        ),
+    )
+    suggest_parser.add_argument(
+        "--merge-floor",
+        type=float,
+        default=DEFAULT_MERGE_FLOOR_SIMILARITY,
+        help=(
+            "Minimum centroid similarity to suggest a merge "
+            f"(por defecto {DEFAULT_MERGE_FLOOR_SIMILARITY})."
+        ),
+    )
+    suggest_parser.add_argument(
+        "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
+    )
+    suggest_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    suggest_parser.add_argument("--max-video-samples", type=int, default=30)
+    suggest_parser.add_argument("--quiet", action="store_true")
+
     tag_parser = subparsers.add_parser(
         "tag",
         help="Attach a tag to a catalog file (creates the tag on first use).",
@@ -2225,6 +2405,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             file_paths=args.files,
             db_path=args.db,
             name=args.name,
+        )
+    elif args.command == "person-suggest":
+        run_person_suggest(
+            target=args.target,
+            similarity_threshold=args.similarity_threshold,
+            merge_floor=args.merge_floor,
+            confidence_threshold=args.confidence_threshold,
+            min_face_size=args.min_face_size,
+            max_video_samples=args.max_video_samples,
+            quiet=args.quiet,
         )
     elif args.command == "tag":
         run_tag(file_ref=args.file_ref, tag_name=args.tag_name, db_path=args.db)
