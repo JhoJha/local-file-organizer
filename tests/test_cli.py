@@ -900,13 +900,14 @@ class ClusterPeopleCliTests(unittest.TestCase):
             printed = self._run()
 
         # duration=2.0s -> 8 sample timestamps; every frame yields the same
-        # fake embedding, so the whole video is ONE person, not 8 people.
+        # fake embedding and bbox, so S1 links all frames into ONE tracklet:
+        # one representative embedding, one person, one member row.
         from local_file_organizer.video_sampling import compute_sample_timestamps
 
         n_frames = len(compute_sample_timestamps(2.0, 30))
         self.assertIn(f"face_observations_considered={n_frames}", printed)
-        self.assertIn(f"usable_embeddings={n_frames}", printed)
-        self.assertIn("rejected_faces=0", printed)
+        self.assertIn("usable_embeddings=1", printed)
+        self.assertIn(f"rejected_faces={n_frames - 1}", printed)
         self.assertIn("person_clusters=1", printed)
         self.assertIn("P0001 files=1 images=0 videos=1", printed)
         self.assertIn("cooccurrence_files=0", printed)
@@ -916,7 +917,7 @@ class ClusterPeopleCliTests(unittest.TestCase):
         self.assertEqual(rows[0][0], "P0001")
         self.assertEqual(rows[0][1], str(clip))
         self.assertEqual(rows[0][2], "video")
-        self.assertEqual(rows[0][3], n_frames)
+        self.assertEqual(rows[0][3], 1)
 
     def test_rejected_counts_cover_filter_and_embedding_failure(self):
         from unittest import mock

@@ -35,6 +35,7 @@ from .face_detection import (
 )
 from .exiftool import exiftool_available, get_exif_metadata
 from .face_embedding import compute_embedding
+from .face_tracking import FrameFace, build_tracklets
 from .face_review import (
     DEFAULT_MAX_PREVIEWS_PER_CLUSTER,
     DEFAULT_THUMBNAIL_MAX_PX,
@@ -703,6 +704,10 @@ def run_cluster_people(
                     video_meta.duration_seconds, max_video_samples
                 )
                 face_counts = {"considered": 0}
+                # Raw per-frame detections stay local to this video: S1
+                # collapses them into tracklets below, so the global
+                # clustering sees one representative per tracklet.
+                frame_detections: list[FrameFace] = []
 
                 def _on_frame(
                     frame_path: Path, timestamp: float, _idx: int
@@ -727,23 +732,12 @@ def run_cluster_people(
                             continue
                         x2 = max(0, round(float(frow2[0])))
                         y2 = max(0, round(float(frow2[1])))
-                        observations.append(
-                            ClusterableObservation(
-                                key=(str(file_path), "video_frame", timestamp_ms2, x2),
+                        frame_detections.append(
+                            FrameFace(
+                                timestamp_ms=timestamp_ms2,
+                                bbox=(x2, y2, w2, h2),
                                 embedding=emb2,
-                            )
-                        )
-                        file_of_obs.append((str(file_path), "video"))
-                        obs_details.append(
-                            (
-                                str(file_path),
-                                "video_frame",
-                                timestamp_ms2,
-                                x2,
-                                y2,
-                                w2,
-                                h2,
-                                float(frow2[14]),
+                                confidence=float(frow2[14]),
                             )
                         )
 
@@ -758,6 +752,38 @@ def run_cluster_people(
                     if not quiet and not redact_paths:
                         print(f"Clustering {file_path}: error: {sampling.video_error}")
                     continue
+                # One representative per tracklet replaces the raw frame
+                # observations (image observations pass through unchanged
+                # in the branch above). Representative detail row shows
+                # the sharpest (highest-confidence) member; the embedding
+                # is the tracklet mean (see face_tracking). Faces merged
+                # into a tracklet count as rejected below (not clustered
+                # independently) — face_observations_considered still
+                # counts every raw detection examined.
+                for tracklet in build_tracklets(
+                    frame_detections,
+                    frame_ms=[ts * 1000 for ts in timestamps],
+                ):
+                    rep = tracklet.representative_member()
+                    observations.append(
+                        ClusterableObservation(
+                            key=(str(file_path), "video_frame", rep.timestamp_ms, rep.bbox[0]),
+                            embedding=tracklet.representative_embedding(),
+                        )
+                    )
+                    file_of_obs.append((str(file_path), "video"))
+                    obs_details.append(
+                        (
+                            str(file_path),
+                            "video_frame",
+                            rep.timestamp_ms,
+                            rep.bbox[0],
+                            rep.bbox[1],
+                            rep.bbox[2],
+                            rep.bbox[3],
+                            rep.confidence,
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
                 if not quiet and not redact_paths:
                     print(f"Clustering {file_path}: error: {exc}")
