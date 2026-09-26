@@ -658,6 +658,13 @@ td.thumb img {
   border: 1px solid #ccc; border-radius: 4px; background: #eee;
 }
 .no-thumb { color: #999; }
+td.open { white-space: nowrap; }
+td.open a {
+  display: inline-block; padding: 0.2rem 0.6rem;
+  border: 1px solid #999; border-radius: 4px; background: #fff;
+  color: #1c1c1c; text-decoration: none;
+}
+p.serve-note { font-size: 0.82rem; color: #444; }
 """
 
 _VIEW_JS = """
@@ -770,6 +777,10 @@ def _render_view_rows(rows: list[dict], include_paths: bool) -> str:
         )
         if include_paths:
             cells += f"<td>{html.escape(row['path'] or '-')}</td>"
+        cells += (
+            f'<td class="open"><a href="/file/{html.escape(row["file_id"])}">'
+            "Abrir</a></td>"
+        )
         rendered.append(
             f'<tr data-file-id="{html.escape(row["file_id"])}" '
             f'data-destination="{html.escape(row["destination"])}" '
@@ -812,7 +823,10 @@ def render_plan_view_html(
     no network calls: filtering runs locally in the browser over the rows
     rendered into the table. Real paths only appear when the caller passes
     ``paths_by_file_id`` (manual ``--show-files`` runs); otherwise the page
-    holds opaque ``F000NNN`` ids only. Thumbnails are referenced by opaque
+    holds opaque ``F000NNN`` ids only. Each row carries an ``Abrir`` link to
+    the relative ``/file/F000NNN`` URL, which serves the original only under
+    the local ``preview-serve`` reader (as a plain static file the links
+    simply have no target). Thumbnails are referenced by opaque
     ``assets/F000NNN.jpg`` sources only; rows without a thumbnail show a
     placeholder cell, never a broken image.
     """
@@ -826,6 +840,7 @@ def render_plan_view_html(
     )
     if include_paths:
         headers += "<th>Path (manual view only)</th>"
+    headers += "<th>Open</th>"
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
@@ -839,6 +854,8 @@ def render_plan_view_html(
         '<header class="site">\n'
         "  <h1>Organization Plan Viewer</h1>\n"
         "  <p class=\"local-only\">LOCAL ONLY — offline static view, no network</p>\n"
+        "  <p class=\"serve-note\">Abrir links open the original file and need "
+        "the local preview-serve reader; the page alone stays fully static.</p>\n"
         f"  {_render_view_summary(counts)}\n"
         f"  {_render_filter_bar(rows)}\n"
         "</header>\n"

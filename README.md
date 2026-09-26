@@ -821,6 +821,31 @@ pass `--show-files` (explicit manual runs), which adds a path column.
 Flags: `--view-dir PATH` overrides the viewer output directory
 (default `<plan-dir>/organization_view`), `--no-view` skips the viewer.
 
+### Preview server (preview-serve)
+
+Each viewer row has an **Abrir** button pointing at the relative
+`/file/F000NNN` URL. Those links only resolve under the local
+read-only reader (as a static `file://` page they simply have no
+target):
+
+```bash
+python -m local_file_organizer preview-serve /path/to/root
+python -m local_file_organizer preview-serve /path/to/root --port 8123
+```
+
+Flags: `--db`, `--plan-path`, `--view-dir` (default
+`<plan-dir>/organization_view`), `--host` (default `127.0.0.1`; any
+other value is refused), `--port` (default `8123`).
+
+Safety note: the server binds strictly to `127.0.0.1` for manual local
+runs only. It serves the viewer directory plus original files addressed
+only by opaque id (`/file/F000NNN`, bound to the catalog positionally
+like `organize-apply`); every served byte must resolve inside the
+explicit target root (outside paths, `..`/absolute routes and symlink
+escapes get a plain 404 with no path disclosure), directory listing is
+off, and only GET/HEAD are served (anything else is refused with 405).
+It never writes, uploads, or mutates anything.
+
 La salida agrupa los destinos (`Media/`, `Revisión/` justo después,
 `Documentos/`, `Audio/`, `Archivos_comprimidos/`, `Software/`, `Otros/`)
 y añade `=== DESTINATIONS ===` (archivos por prefijo:

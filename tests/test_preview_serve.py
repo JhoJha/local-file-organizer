@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from local_file_organizer import database, preview_serve
+from local_file_organizer.organization_plan import render_plan_view_html
 from local_file_organizer.organization_preview import generate_organization_preview
 
 
@@ -145,6 +146,35 @@ class PreviewServeTests(unittest.TestCase):
                     host=host,
                     port=0,
                 )
+
+
+class AbrirButtonTests(unittest.TestCase):
+    def test_rows_link_to_file_id_and_keep_static_page(self):
+        entries = [
+            {
+                "file_id": "F000001",
+                "category": "document",
+                "bucket": "planned",
+                "proposed_destination": "Documentos/PDF/",
+                "reason_codes": ["extension:pdf"],
+                "flags": [],
+                "confidence_level": "high",
+                "action": "preview_only",
+            }
+        ]
+        counts = {
+            "catalog_files": 1,
+            "planned": 1,
+            "review": 0,
+            "unsupported": 0,
+            "by_destination": {"Documentos/PDF/": 1},
+            "confidence_levels": {"high": 1, "medium": 0, "low": 0},
+        }
+        html = render_plan_view_html(entries, counts)
+        self.assertIn('<a href="/file/F000001">Abrir</a>', html)
+        self.assertIn("<th>Open</th>", html)
+        for token in ("http://", "https://", "fetch(", "<script src"):
+            self.assertNotIn(token, html)
 
 
 if __name__ == "__main__":
