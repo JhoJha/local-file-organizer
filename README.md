@@ -753,6 +753,26 @@ que lo ejecutes tú manualmente: Claude/Muse nunca debe invocarlo contra
 datos personales reales durante una sesión de desarrollo (la salida por
 defecto nunca contiene rutas).
 
+### Organization plan viewer (static HTML)
+
+`organize-preview` also writes an offline viewer next to the plan JSON:
+
+```text
+reports/organization_view/
+└── index.html          # static page, inline CSS/JS, no remote resources
+```
+
+Open `reports/organization_view/index.html` in a browser to browse every
+plan entry (`F000NNN` id, category, destination, confidence, persons,
+flags, reasons) and filter it by destination, person (`P000N` /
+`PERSON_XXXX`) and confidence (`high` / `medium` / `low`). All filtering
+runs locally in the page; the viewer makes no network calls.
+
+Privacy: the viewer holds opaque ids only — no real paths — unless you
+pass `--show-files` (explicit manual runs), which adds a path column.
+Flags: `--view-dir PATH` overrides the viewer output directory
+(default `<plan-dir>/organization_view`), `--no-view` skips the viewer.
+
 La salida agrupa los destinos (`Media/`, `Revisión/` justo después,
 `Documentos/`, `Audio/`, `Archivos_comprimidos/`, `Software/`, `Otros/`)
 y añade `=== DESTINATIONS ===` (archivos por prefijo:

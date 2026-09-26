@@ -19,10 +19,13 @@ from .organization_plan import (
     DESTINATION_REVIEW_SCAN,
     DESTINATION_REVIEW_UNCERTAIN,
     DESTINATION_SIN_PERSONAS,
+    VIEW_DIR_NAME,
     build_organization_plan,
     plan_counts,
     write_plan_json,
+    write_plan_view_site,
 )
+from .person_identity import resolve_file_persons
 
 
 class OrganizationPreviewError(Exception):
@@ -53,6 +56,7 @@ class PreviewResult:
     entries: list[dict[str, Any]]
     counts: dict[str, Any]
     paths_by_destination: dict[str, list[str]]
+    view_path: Path | None = None
 
 
 def generate_organization_preview(
@@ -60,11 +64,17 @@ def generate_organization_preview(
     plan_path: Path,
     decisions_path: Path | None = None,
     show_files: bool = False,
+    view_dir: Path | None = None,
+    write_view: bool = True,
 ) -> PreviewResult:
     """Generate the organization plan and return structured preview data.
 
     This function is strictly read-only on the catalog database and decisions file,
-    and only writes the output plan JSON to `plan_path`. It produces no stdout/stderr
+    and only writes the output plan JSON to `plan_path` plus the static offline
+    viewer (`index.html`) under `view_dir` (default: `<plan_dir>/organization_view`).
+    Pass `write_view=False` to skip the viewer. Real paths are embedded in the
+    viewer only when `show_files` is true (explicit manual runs); otherwise the
+    viewer holds opaque file ids only. It produces no stdout/stderr
     and raises typed exceptions instead of terminating the process.
     """
     if not db_path.exists():
@@ -97,23 +107,51 @@ def generate_organization_preview(
         write_plan_json(entries, plan_path)
 
         paths_by_destination: dict[str, list[str]] = {}
-        if show_files:
+        persons_by_file_id: dict[str, list[str]] = {}
+        paths_by_file_id: dict[str, str] | None = None
+        if show_files or write_view:
             rows = conn.execute(
                 "SELECT path FROM files WHERE COALESCE(file_state, 'active') = 'active' ORDER BY path ASC"
             ).fetchall()
             dest_by_index = [e["proposed_destination"] for e in entries]
-            if len(rows) != len(dest_by_index):
+            aligned = len(rows) == len(dest_by_index)
+            if not aligned and show_files:
                 raise PlanDesyncError(
                     f"desincronización en organize-preview: {len(rows)} archivos activos pero {len(dest_by_index)} entradas de plan"
                 )
-            for row, dest in zip(rows, dest_by_index):
-                paths_by_destination.setdefault(dest, []).append(row["path"])
+            if aligned:
+                person_sets = resolve_file_persons(conn)
+                for row, entry in zip(rows, entries):
+                    persons = sorted(person_sets.get(row["path"], ()))
+                    if persons:
+                        persons_by_file_id[entry["file_id"]] = persons
+                if show_files:
+                    paths_by_file_id = {
+                        entry["file_id"]: row["path"]
+                        for row, entry in zip(rows, entries)
+                    }
+                    for row, dest in zip(rows, dest_by_index):
+                        paths_by_destination.setdefault(dest, []).append(row["path"])
+
+        view_path: Path | None = None
+        if write_view:
+            resolved_view_dir = (
+                view_dir if view_dir is not None else plan_path.parent / VIEW_DIR_NAME
+            )
+            view_path = write_plan_view_site(
+                entries,
+                counts,
+                resolved_view_dir,
+                persons_by_file_id=persons_by_file_id,
+                paths_by_file_id=paths_by_file_id,
+            )
 
         return PreviewResult(
             plan_path=plan_path,
             entries=entries,
             counts=counts,
             paths_by_destination=paths_by_destination,
+            view_path=view_path,
         )
     finally:
         conn.close()

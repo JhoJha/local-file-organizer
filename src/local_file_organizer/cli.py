@@ -1038,12 +1038,18 @@ def run_organize_preview(
     decisions_path: Path = DEFAULT_FACE_REVIEW_DECISIONS,
     show_files: bool = False,
     quiet: bool = False,
+    view_dir: Path | None = None,
+    write_view: bool = True,
 ) -> None:
     """Build the read-only organization preview from the SQLite catalog.
 
     Only reads the catalog database and the local human decisions file, and
-    writes ``reports/organization_plan.json``; never walks the filesystem or
-    touches the scanned tree. A missing decisions file means no decisions.
+    writes ``reports/organization_plan.json`` plus the static offline viewer
+    (``index.html`` under ``reports/organization_view/`` unless ``view_dir``
+    overrides it); never walks the filesystem or touches the scanned tree.
+    A missing decisions file means no decisions. Pass ``write_view=False``
+    (``--no-view``) to skip the viewer; real paths are embedded in the
+    viewer only under ``show_files`` (explicit manual runs).
 
     NOTE: 'quiet' is currently ineffective in run_organize_preview and is
     retained for CLI signature compatibility. The preview tree is always printed.
@@ -1063,6 +1069,8 @@ def run_organize_preview(
             plan_path=plan_path,
             decisions_path=decisions_path,
             show_files=show_files,
+            view_dir=view_dir,
+            write_view=write_view,
         )
     except (CatalogNotFoundError, CatalogEmptyError):
         print(
@@ -1076,6 +1084,8 @@ def run_organize_preview(
 
     report = format_preview_report(result, show_files=show_files)
     print(report)
+    if result.view_path is not None:
+        print(f"View: {_display_path(result.view_path)}")
 
 
 def run_face_review(
@@ -1562,6 +1572,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     preview_parser.add_argument("--quiet", action="store_true")
+    preview_parser.add_argument(
+        "--view-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory for the static offline plan viewer "
+            "(default: <plan-dir>/organization_view)."
+        ),
+    )
+    preview_parser.add_argument(
+        "--no-view",
+        action="store_true",
+        help="Skip writing the static offline plan viewer.",
+    )
 
     review_parser = subparsers.add_parser(
         "face-review",
@@ -1784,6 +1808,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             decisions_path=args.decisions,
             show_files=args.show_files,
             quiet=args.quiet,
+            view_dir=args.view_dir,
+            write_view=not args.no_view,
         )
     elif args.command == "face-review":
         run_face_review(

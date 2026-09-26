@@ -14,6 +14,7 @@ to prefer a false negative (route to ``Revisión/``) over a false positive
 """
 from __future__ import annotations
 
+import html
 import json
 import sqlite3
 from pathlib import Path
@@ -427,6 +428,295 @@ def write_plan_json(entries: list[dict], plan_path: Path) -> None:
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     with open(plan_path, "w", encoding="utf-8") as handle:
         json.dump(entries, handle, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Static offline plan viewer (T1)
+# ---------------------------------------------------------------------------
+
+VIEW_DIR_NAME = "organization_view"
+VIEW_INDEX_FILENAME = "index.html"
+
+CONFIDENCE_LEVELS = (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
+    CONFIDENCE_LOW,
+)
+
+
+def build_plan_view_rows(
+    entries: list[dict],
+    persons_by_file_id: dict[str, list[str]] | None = None,
+    paths_by_file_id: dict[str, str] | None = None,
+) -> list[dict]:
+    """Derive viewer rows from plan entries plus optional overlays.
+
+    The plan entries themselves never carry persons or real paths (privacy:
+    ``organization_plan.json`` only holds opaque ``F000NNN`` ids). The
+    ``persons`` facet comes from the caller-supplied overlay (resolved from
+    the catalog at preview time), and ``path`` is only attached when the
+    caller explicitly passes ``paths_by_file_id`` (manual ``--show-files``
+    runs). With both overlays omitted the rows contain no personal data
+    beyond opaque ids and proposed destinations.
+    """
+    persons_by_file_id = persons_by_file_id or {}
+    rows = []
+    for entry in entries:
+        file_id = entry["file_id"]
+        persons = sorted(set(persons_by_file_id.get(file_id, ())))
+        path = (paths_by_file_id or {}).get(file_id)
+        rows.append(
+            {
+                "file_id": file_id,
+                "category": entry["category"],
+                "bucket": entry["bucket"],
+                "destination": entry["proposed_destination"],
+                "confidence": entry["confidence_level"],
+                "persons": persons,
+                "flags": list(entry["flags"]),
+                "reasons": list(entry["reason_codes"]),
+                "path": path,
+            }
+        )
+    return rows
+
+
+_VIEW_CSS = """
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 0 1rem 3rem;
+  font-family: system-ui, sans-serif;
+  background: #f5f5f5; color: #1c1c1c;
+}
+header.site { padding: 1rem 0; }
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+.local-only {
+  display: inline-block; margin: 0 0 0.75rem; padding: 0.2rem 0.5rem;
+  background: #1c1c1c; color: #fff; font-size: 0.8rem;
+  border-radius: 4px; letter-spacing: 0.02em;
+}
+dl.summary { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; margin: 0 0 0.75rem; }
+dl.summary div { margin: 0; }
+dl.summary dt { font-size: 0.7rem; text-transform: uppercase; color: #555; }
+dl.summary dd { margin: 0; font-size: 1.1rem; font-weight: 600; }
+form.filters {
+  display: flex; gap: 1rem; flex-wrap: wrap; align-items: end;
+  background: #fff; border: 1px solid #ddd; border-radius: 6px;
+  padding: 0.75rem; margin: 0 0 1rem;
+}
+form.filters label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: #444; }
+form.filters select { padding: 0.3rem 0.5rem; font-size: 0.85rem; max-width: 22rem; }
+button { padding: 0.35rem 0.7rem; border: 1px solid #999; border-radius: 4px; background: #fff; cursor: pointer; font-size: 0.85rem; }
+#match-line { font-size: 0.85rem; color: #444; }
+table { width: 100%; border-collapse: collapse; background: #fff; font-size: 0.82rem; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
+thead th { background: #ececec; position: sticky; top: 0; }
+td.id { font-family: monospace; white-space: nowrap; }
+td.dest { font-family: monospace; }
+td.reasons { font-family: monospace; color: #444; }
+"""
+
+_VIEW_JS = """
+(function () {
+  "use strict";
+  var destSelect = document.getElementById("filter-destination");
+  var personSelect = document.getElementById("filter-person");
+  var confidenceSelect = document.getElementById("filter-confidence");
+  var matchCount = document.getElementById("match-count");
+  var rows = Array.prototype.slice.call(document.querySelectorAll("tbody tr"));
+  function personsOf(row) {
+    var raw = row.getAttribute("data-persons") || "";
+    return raw.split(" ").filter(function (p) { return p.length > 0; });
+  }
+  function applyFilters() {
+    var dest = destSelect.value;
+    var person = personSelect.value;
+    var confidence = confidenceSelect.value;
+    var visible = 0;
+    rows.forEach(function (row) {
+      var show = true;
+      if (dest !== "all" && row.getAttribute("data-destination") !== dest) { show = false; }
+      if (show && confidence !== "all" && row.getAttribute("data-confidence") !== confidence) { show = false; }
+      if (show && person !== "all") {
+        var persons = personsOf(row);
+        if (person === "none") {
+          if (persons.length !== 0) { show = false; }
+        } else if (persons.indexOf(person) === -1) { show = false; }
+      }
+      row.style.display = show ? "" : "none";
+      if (show) { visible += 1; }
+    });
+    matchCount.textContent = String(visible);
+  }
+  [destSelect, personSelect, confidenceSelect].forEach(function (el) {
+    el.addEventListener("change", applyFilters);
+  });
+  document.getElementById("reset-filters").addEventListener("click", function () {
+    destSelect.value = "all";
+    personSelect.value = "all";
+    confidenceSelect.value = "all";
+    applyFilters();
+  });
+  applyFilters();
+})();
+"""
+
+
+def _view_option(value: str, label: str, selected: bool = False) -> str:
+    selected_attr = " selected" if selected else ""
+    return f'<option value="{html.escape(value)}"{selected_attr}>{html.escape(label)}</option>'
+
+
+def _render_filter_bar(rows: list[dict]) -> str:
+    """Render the destination/person/confidence filter controls."""
+    destinations = sorted({row["destination"] for row in rows})
+    persons = sorted({label for row in rows for label in row["persons"]})
+    dest_options = [_view_option("all", "All destinations", True)]
+    dest_options += [_view_option(d, d) for d in destinations]
+    person_options = [_view_option("all", "All persons", True)]
+    person_options.append(_view_option("none", "No person assigned"))
+    person_options += [_view_option(label, label) for label in persons]
+    confidence_options = [_view_option("all", "All confidence levels", True)]
+    confidence_options += [_view_option(level, level) for level in CONFIDENCE_LEVELS]
+    return (
+        '<form class="filters" id="filters">\n'
+        '  <label>Destination\n'
+        f'    <select id="filter-destination">\n      {" ".join(dest_options)}\n    </select>\n'
+        "  </label>\n"
+        "  <label>Person\n"
+        f'    <select id="filter-person">\n      {" ".join(person_options)}\n    </select>\n'
+        "  </label>\n"
+        "  <label>Confidence\n"
+        f'    <select id="filter-confidence">\n      {" ".join(confidence_options)}\n    </select>\n'
+        "  </label>\n"
+        '  <button type="button" id="reset-filters">Reset filters</button>\n'
+        f'  <span id="match-line"><span id="match-count">{len(rows)}</span>'
+        f" of {len(rows)} shown</span>\n"
+        "</form>"
+    )
+
+
+def _render_view_rows(rows: list[dict], include_paths: bool) -> str:
+    """Render one table row per plan entry with filterable data attributes."""
+    rendered = []
+    for row in rows:
+        persons = row["persons"]
+        persons_attr = " ".join(persons)
+        persons_cell = ", ".join(persons) if persons else "-"
+        flags_cell = ", ".join(row["flags"]) if row["flags"] else "-"
+        reasons_cell = ", ".join(row["reasons"]) if row["reasons"] else "-"
+        cells = (
+            f'<td class="id">{html.escape(row["file_id"])}</td>'
+            f"<td>{html.escape(row['category'])}</td>"
+            f'<td class="dest">{html.escape(row["destination"])}</td>'
+            f"<td>{html.escape(row['confidence'])}</td>"
+            f"<td>{html.escape(persons_cell)}</td>"
+            f"<td>{html.escape(flags_cell)}</td>"
+            f'<td class="reasons">{html.escape(reasons_cell)}</td>'
+        )
+        if include_paths:
+            cells += f"<td>{html.escape(row['path'] or '-')}</td>"
+        rendered.append(
+            f'<tr data-file-id="{html.escape(row["file_id"])}" '
+            f'data-destination="{html.escape(row["destination"])}" '
+            f'data-confidence="{html.escape(row["confidence"])}" '
+            f'data-persons="{html.escape(persons_attr)}">'
+            f"{cells}</tr>"
+        )
+    return "\n".join(rendered)
+
+
+def _render_view_summary(counts: dict) -> str:
+    """Render aggregate counts (destinations, confidence, accounting)."""
+    confidence = counts.get("confidence_levels", {})
+    fields = [
+        ("files", counts.get("catalog_files", 0)),
+        ("planned", counts.get("planned", 0)),
+        ("review", counts.get("review", 0)),
+        ("unsupported", counts.get("unsupported", 0)),
+        ("high", confidence.get(CONFIDENCE_HIGH, 0)),
+        ("medium", confidence.get(CONFIDENCE_MEDIUM, 0)),
+        ("low", confidence.get(CONFIDENCE_LOW, 0)),
+    ]
+    items = "\n      ".join(
+        f"<div><dt>{html.escape(name)}</dt><dd>{value}</dd></div>"
+        for name, value in fields
+    )
+    return f'<dl class="summary">\n      {items}\n  </dl>'
+
+
+def render_plan_view_html(
+    entries: list[dict],
+    counts: dict,
+    persons_by_file_id: dict[str, list[str]] | None = None,
+    paths_by_file_id: dict[str, str] | None = None,
+) -> str:
+    """Render the fully static, offline plan viewer page (deterministic).
+
+    The page inlines its CSS/JS, references no remote resources, and makes
+    no network calls: filtering runs locally in the browser over the rows
+    rendered into the table. Real paths only appear when the caller passes
+    ``paths_by_file_id`` (manual ``--show-files`` runs); otherwise the page
+    holds opaque ``F000NNN`` ids only.
+    """
+    rows = build_plan_view_rows(entries, persons_by_file_id, paths_by_file_id)
+    include_paths = paths_by_file_id is not None
+    headers = (
+        "<th>File</th><th>Category</th><th>Destination</th>"
+        "<th>Confidence</th><th>Persons</th><th>Flags</th><th>Reasons</th>"
+    )
+    if include_paths:
+        headers += "<th>Path (manual view only)</th>"
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>Organization Plan Viewer</title>\n"
+        f"<style>{_VIEW_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        '<header class="site">\n'
+        "  <h1>Organization Plan Viewer</h1>\n"
+        "  <p class=\"local-only\">LOCAL ONLY — offline static view, no network</p>\n"
+        f"  {_render_view_summary(counts)}\n"
+        f"  {_render_filter_bar(rows)}\n"
+        "</header>\n"
+        "<main>\n"
+        "<table>\n"
+        f"<thead><tr>{headers}</tr></thead>\n"
+        "<tbody>\n"
+        f"{_render_view_rows(rows, include_paths)}\n"
+        "</tbody>\n"
+        "</table>\n"
+        "</main>\n"
+        "<script>\n"
+        f"{_VIEW_JS}"
+        "</script>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def write_plan_view_site(
+    entries: list[dict],
+    counts: dict,
+    output_dir: Path,
+    persons_by_file_id: dict[str, list[str]] | None = None,
+    paths_by_file_id: dict[str, str] | None = None,
+) -> Path:
+    """Write ``index.html`` (the offline plan viewer) under ``output_dir``."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    index_path = output_dir / VIEW_INDEX_FILENAME
+    with open(index_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            render_plan_view_html(
+                entries, counts, persons_by_file_id, paths_by_file_id
+            )
+        )
+    return index_path
 
 
 def plan_counts(entries: list[dict]) -> dict[str, int]:
