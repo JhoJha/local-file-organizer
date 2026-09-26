@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -20,6 +21,7 @@ import cv2
 
 from . import database
 from . import person_identity
+from . import threshold_calibration
 from .person_suggest import (
     DEFAULT_MERGE_FLOOR_SIMILARITY,
     SUGGEST_SIMILARITY_METRIC,
@@ -31,6 +33,7 @@ from .face_clustering import assign_person_labels, cluster_people
 from .face_clustering import (
     ClusterableObservation,
     DEFAULT_SIMILARITY_THRESHOLD as DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+    LINKAGE_COMPLETE,
 )
 from .face_detection import (
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -88,6 +91,19 @@ DEFAULT_FACE_REVIEW_DIR = PROJECT_ROOT / "reports" / "face_review"
 DEFAULT_FACE_REVIEW_DECISIONS = PROJECT_ROOT / "data" / "face_review_decisions.json"
 
 _PROGRESS_INTERVAL = 500
+
+# Shared --min-face-size help (R2-001): the gate compares each box SIDE
+# (w and h separately) against this value — it is a side length, not an
+# area. The quality weight (`face_size_px` in face_tracking) is instead
+# the w*h box AREA. Same flag text on every subcommand.
+_MIN_FACE_SIZE_HELP = (
+    "Minimum face SIDE length in px: a detection survives only when "
+    "BOTH box sides (w, h) clear it (boundary inclusive). This is a "
+    "side length, not an area — quality weights use the w*h box AREA."
+)
+
+_DEFAULT_SIM_GRID = "0.40,0.45,0.50,0.55,0.60"
+_DEFAULT_FLOOR_GRID = "0.30,0.35,0.40,0.45"
 
 
 def _display_path(path: Path) -> str:
@@ -596,59 +612,63 @@ def run_detect_faces(
     conn.close()
 
 
-def run_cluster_people(
+@dataclass
+class CollectedFaces:
+    """Memory-only face-observation batch shared by the recompute path.
+
+    Single ingestion path (T2) for `cluster-people`, `person-suggest`
+    and `person-calibrate`: the same quality gate, embedding, and
+    tracklet calls, so calibration cannot drift from what clustering
+    actually clustered (the 4 ingestion sites — cluster/suggest ×
+    image/video — collapsed into one helper). Embeddings stay transient
+    and are never persisted here. `weights` holds one quality weight per
+    observation — image: confidence*area*sharpness from the gate (R2-002:
+    image sites now USE size/sharpness instead of discarding them);
+    video tracklet: summed member quality. `details` carries the
+    per-observation catalog rows only when `include_details` is set (the
+    cluster path persists them; suggest/calibrate never do).
+    `considered` counts every raw detection examined, including
+    gate/embedding rejects.
+    """
+
+    observations: list[ClusterableObservation]
+    file_of_obs: list[tuple[str, str]]  # (file_path, file_category) per observation
+    weights: list[float]  # quality weight per observation, parallel to observations
+    details: list[tuple]  # per-observation detail row, parallel (maybe empty)
+    considered: int  # raw detections examined
+
+
+def _collect_face_observations(
     target: Path,
-    db_path: Path = DEFAULT_DB_PATH,
-    similarity_threshold: float = DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+    *,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
     max_video_samples: int = 30,
-    redact_paths: bool = False,
     quiet: bool = False,
-    verify_readonly: bool = False,
-    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
-) -> None:
-    """Cluster face embeddings into anonymous person labels (P0001, ...).
+    log_prefix: str = "Clustering",
+    verbose_files: bool = False,
+    redact_paths: bool = False,
+    include_details: bool = False,
+    on_error=None,
+) -> CollectedFaces:
+    """Run the shared detection/embedding/tracklet path (memory-only).
 
-    Embeddings live only as transient in-memory arrays during this run and
-    are discarded when it ends; only the derived anonymous (person label,
-    file) membership rows are persisted (full rebuild of
-    `person_cluster_members` on every run).
+    `log_prefix` names the caller in progress/error lines ("Clustering",
+    "Suggest", "Calibrate"). `verbose_files` reproduces the
+    `cluster-people` per-file progress/error lines; quieter callers
+    (suggest, calibrate) only surface hard per-file errors. Never
+    persists anything; never prints embeddings or vectors.
     """
-    if not target.exists():
-        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
-        print(
-            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
-            "punto de montaje o crea la carpeta esperada.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    if not target.is_dir():
-        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
-        raise SystemExit(1)
-
-    start = time.perf_counter()
-    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
-    walk_errors: list[ScanError] = []
-
-    def _on_error(err: ScanError) -> None:
-        walk_errors.append(err)
-        if not quiet and not redact_paths:
-            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
-
-    before_snapshot = None
-    if verify_readonly:
-        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
-        save_snapshot(before_snapshot, snapshot_dir / "before.json")
-
-    conn = database.connect(db_path)
     observations: list[ClusterableObservation] = []
-    file_of_obs: list[tuple[str, str]] = []  # (file_path, file_category) per observation
-    obs_details: list[tuple] = []  # per-observation detail row, parallel to file_of_obs
-    face_observations_considered = 0
+    file_of_obs: list[tuple[str, str]] = []
+    weights: list[float] = []
+    details: list[tuple] = []
+    considered = 0
     processed_files = 0
 
-    for file_path in iter_files(target, ignored_dirs=ignored_dirs, on_error=_on_error):
+    for file_path in iter_files(
+        target, ignored_dirs=set(DEFAULT_IGNORED_DIRS), on_error=on_error
+    ):
         category = classify(file_path.suffix)
         if category == "image":
             processed_files += 1
@@ -658,22 +678,24 @@ def run_cluster_people(
                 )
             except Exception as exc:  # noqa: BLE001 - one bad image never aborts the run
                 if not quiet and not redact_paths:
-                    print(f"Clustering {file_path}: error: {exc}")
+                    print(f"{log_prefix} {file_path}: error: {exc}")
                 continue
             if error is not None or rows is None:
-                if error is not None and not quiet and not redact_paths:
-                    print(f"Clustering {file_path}: error: {error}")
-                if not quiet and redact_paths:
+                if error is not None and verbose_files and not quiet and not redact_paths:
+                    print(f"{log_prefix} {file_path}: error: {error}")
+                if verbose_files and not quiet and redact_paths:
                     if processed_files % 10 == 0 or processed_files == 1:
                         print(f"Procesados {processed_files} archivos...")
                 continue
             img = cv2.imread(str(file_path))
             for row in rows:
-                face_observations_considered += 1
+                considered += 1
                 # Shared quality gate (conf re-check + size + blur over
-                # the already-loaded ROI): one bar for all 4 ingestion
-                # sites, so cluster and suggest cannot drift apart.
-                ok, _face_size, _sharpness = passes_quality_gate(
+                # the already-loaded ROI): one bar for every ingestion
+                # site, so cluster, suggest and calibrate cannot drift
+                # apart. Image sites keep the returned size/sharpness as
+                # the observation quality weight (R2-002).
+                ok, face_size, sharpness = passes_quality_gate(
                     img,
                     row,
                     min_face_size_px=min_face_size,
@@ -695,23 +717,25 @@ def run_cluster_people(
                     )
                 )
                 file_of_obs.append((str(file_path), "image"))
-                obs_details.append(
-                    (str(file_path), "image", None, x, y, w, h, float(row[14]))
-                )
-            if not quiet:
+                weights.append(float(row[14]) * face_size * sharpness)
+                if include_details:
+                    details.append(
+                        (str(file_path), "image", None, x, y, w, h, float(row[14]))
+                    )
+            if verbose_files and not quiet:
                 if redact_paths:
                     if processed_files % 10 == 0 or processed_files == 1:
                         print(f"Procesados {processed_files} archivos...")
                 else:
-                    print(f"Clustering {file_path}: {len(rows)} caras detectadas")
+                    print(f"{log_prefix} {file_path}: {len(rows)} caras detectadas")
         elif category == "video":
             processed_files += 1
             try:
                 video_meta = get_video_metadata(file_path)
                 if video_meta.error or video_meta.duration_seconds is None:
                     result_error = video_meta.error or "no duration available"
-                    if not quiet and not redact_paths:
-                        print(f"Clustering {file_path}: error: {result_error}")
+                    if verbose_files and not quiet and not redact_paths:
+                        print(f"{log_prefix} {file_path}: error: {result_error}")
                     continue
                 timestamps = compute_sample_timestamps(
                     video_meta.duration_seconds, max_video_samples
@@ -768,19 +792,21 @@ def run_cluster_people(
                     on_frame=_on_frame,
                     keep_debug_frames=False,
                 )
-                face_observations_considered += face_counts["considered"]
+                considered += face_counts["considered"]
                 if sampling.video_error is not None:
-                    if not quiet and not redact_paths:
-                        print(f"Clustering {file_path}: error: {sampling.video_error}")
+                    if verbose_files and not quiet and not redact_paths:
+                        print(f"{log_prefix} {file_path}: error: {sampling.video_error}")
                     continue
                 # One representative per tracklet replaces the raw frame
                 # observations (image observations pass through unchanged
                 # in the branch above). Representative detail row shows
                 # the sharpest (highest-confidence) member; the embedding
-                # is the tracklet mean (see face_tracking). Faces merged
-                # into a tracklet count as rejected below (not clustered
-                # independently) — face_observations_considered still
-                # counts every raw detection examined.
+                # is the quality-weighted tracklet mean (see
+                # face_tracking). The tracklet weight is the summed member
+                # quality (more evidence = more centroid pull). Faces
+                # merged into a tracklet count as rejected below (not
+                # clustered independently) — considered still counts every
+                # raw detection examined.
                 for tracklet in build_tracklets(
                     frame_detections,
                     frame_ms=[ts * 1000 for ts in timestamps],
@@ -793,35 +819,119 @@ def run_cluster_people(
                         )
                     )
                     file_of_obs.append((str(file_path), "video"))
-                    obs_details.append(
-                        (
-                            str(file_path),
-                            "video_frame",
-                            rep.timestamp_ms,
-                            rep.bbox[0],
-                            rep.bbox[1],
-                            rep.bbox[2],
-                            rep.bbox[3],
-                            rep.confidence,
+                    weights.append(
+                        float(
+                            sum(
+                                m.quality if m.quality is not None else m.confidence
+                                for m in tracklet.members
+                            )
                         )
                     )
+                    if include_details:
+                        details.append(
+                            (
+                                str(file_path),
+                                "video_frame",
+                                rep.timestamp_ms,
+                                rep.bbox[0],
+                                rep.bbox[1],
+                                rep.bbox[2],
+                                rep.bbox[3],
+                                rep.confidence,
+                            )
+                        )
             except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
                 if not quiet and not redact_paths:
-                    print(f"Clustering {file_path}: error: {exc}")
+                    print(f"{log_prefix} {file_path}: error: {exc}")
                 continue
 
-            if not quiet:
+            if verbose_files and not quiet:
                 if redact_paths:
                     if processed_files % 10 == 0 or processed_files == 1:
                         print(f"Procesados {processed_files} archivos...")
                 # else: per-video line omitted to avoid noisy frame counts;
                 # the sanitized summary below is the contract.
 
+    return CollectedFaces(
+        observations=observations,
+        file_of_obs=file_of_obs,
+        weights=weights,
+        details=details,
+        considered=considered,
+    )
+
+
+def run_cluster_people(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    similarity_threshold: float = DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
+    max_video_samples: int = 30,
+    redact_paths: bool = False,
+    quiet: bool = False,
+    verify_readonly: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+    linkage: str = LINKAGE_COMPLETE,
+) -> None:
+    """Cluster face embeddings into anonymous person labels (P0001, ...).
+
+    Embeddings live only as transient in-memory arrays during this run and
+    are discarded when it ends; only the derived anonymous (person label,
+    file) membership rows are persisted (full rebuild of
+    `person_cluster_members` on every run).
+    """
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        print(
+            "No se inventará ni escaneará ninguna otra ruta. Verifica el "
+            "punto de montaje o crea la carpeta esperada.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+
+    start = time.perf_counter()
+    ignored_dirs = set(DEFAULT_IGNORED_DIRS)
+    walk_errors: list[ScanError] = []
+
+    def _on_error(err: ScanError) -> None:
+        walk_errors.append(err)
+        if not quiet and not redact_paths:
+            print(f"AVISO: no se pudo listar {err.path}: {err.message}", file=sys.stderr)
+
+    before_snapshot = None
+    if verify_readonly:
+        before_snapshot = capture_snapshot(target, ignored_dirs=ignored_dirs, on_error=_on_error)
+        save_snapshot(before_snapshot, snapshot_dir / "before.json")
+
+    conn = database.connect(db_path)
+    collected = _collect_face_observations(
+        target,
+        confidence_threshold=confidence_threshold,
+        min_face_size=min_face_size,
+        max_video_samples=max_video_samples,
+        quiet=quiet,
+        log_prefix="Clustering",
+        verbose_files=True,
+        redact_paths=redact_paths,
+        include_details=True,
+        on_error=_on_error,
+    )
+    observations = collected.observations
+    file_of_obs = collected.file_of_obs
+    obs_details = collected.details
+    face_observations_considered = collected.considered
+
     usable_embeddings = len(observations)
     rejected_faces = face_observations_considered - usable_embeddings
 
     distance_threshold = 1.0 - similarity_threshold
-    clusters = cluster_people(observations, threshold=distance_threshold)
+    clusters = cluster_people(
+        observations, threshold=distance_threshold, linkage=linkage
+    )
     labels = assign_person_labels(clusters)
 
     # For each (file_path, file_category) group, count observations per person.
@@ -912,12 +1022,14 @@ def run_person_suggest(
     min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
     max_video_samples: int = 30,
     quiet: bool = False,
+    linkage: str = LINKAGE_COMPLETE,
 ) -> None:
     """Suggest merge candidates between person clusters (S2, read-only).
 
     Recomputes embeddings through the same detection/embedding/tracklet
-    path as `run_cluster_people` (memory-only, never persisted), rebuilds
-    the clusters at `similarity_threshold`, then lists pairs whose
+    path as `run_cluster_people` (memory-only, never persisted — both go
+    through `_collect_face_observations`), rebuilds the clusters at
+    `similarity_threshold`, then lists pairs whose quality-weighted
     centroid cosine similarity falls in [merge_floor, split threshold)
     with evidence. Suggestions only: nothing is merged or written; the
     user confirms with `person-merge`.
@@ -935,110 +1047,22 @@ def run_person_suggest(
         )
         raise SystemExit(1)
 
-    observations: list[ClusterableObservation] = []
-    file_of_obs: list[tuple[str, str]] = []
+    collected = _collect_face_observations(
+        target,
+        confidence_threshold=confidence_threshold,
+        min_face_size=min_face_size,
+        max_video_samples=max_video_samples,
+        quiet=quiet,
+        log_prefix="Suggest",
+        verbose_files=False,
+        include_details=False,
+    )
+    observations = collected.observations
+    file_of_obs = collected.file_of_obs
 
-    for file_path in iter_files(target, ignored_dirs=set(DEFAULT_IGNORED_DIRS)):
-        category = classify(file_path.suffix)
-        if category == "image":
-            try:
-                _w, _h, rows, error = detect_faces_raw(
-                    file_path, confidence_threshold=confidence_threshold
-                )
-            except Exception as exc:  # noqa: BLE001 - one bad image never aborts the run
-                if not quiet:
-                    print(f"Suggest {file_path}: error: {exc}")
-                continue
-            if error is not None or rows is None:
-                continue
-            img = cv2.imread(str(file_path))
-            for row in rows:
-                # Same shared quality gate as run_cluster_people (site 3
-                # of 4): conf re-check + size + blur over the loaded ROI.
-                ok, _face_size, _sharpness = passes_quality_gate(
-                    img,
-                    row,
-                    min_face_size_px=min_face_size,
-                    confidence_threshold=confidence_threshold,
-                )
-                if not ok:
-                    continue
-                emb = compute_embedding(img, row)
-                if emb is None:
-                    continue
-                observations.append(
-                    ClusterableObservation(
-                        key=(str(file_path), "image", -1, max(0, round(float(row[0])))),
-                        embedding=emb,
-                    )
-                )
-                file_of_obs.append((str(file_path), "image"))
-        elif category == "video":
-            try:
-                video_meta = get_video_metadata(file_path)
-                if video_meta.error or video_meta.duration_seconds is None:
-                    continue
-                timestamps = compute_sample_timestamps(
-                    video_meta.duration_seconds, max_video_samples
-                )
-                frame_detections: list[FrameFace] = []
-
-                def _on_frame(frame_path: Path, timestamp: float, _idx: int) -> None:
-                    _fw, _fh, frows, ferror = detect_faces_raw(
-                        frame_path, confidence_threshold=confidence_threshold
-                    )
-                    if ferror is not None or frows is None:
-                        return
-                    frame_img = cv2.imread(str(frame_path))
-                    if frame_img is None:
-                        return
-                    for frow in frows:
-                        # Same shared quality gate (site 4 of 4).
-                        ok, size, sharp = passes_quality_gate(
-                            frame_img,
-                            frow,
-                            min_face_size_px=min_face_size,
-                            confidence_threshold=confidence_threshold,
-                        )
-                        if not ok:
-                            continue
-                        emb = compute_embedding(frame_img, frow)
-                        if emb is None:
-                            continue
-                        w, h = round(float(frow[2])), round(float(frow[3]))
-                        frame_detections.append(
-                            FrameFace(
-                                timestamp_ms=timestamp * 1000,
-                                bbox=(max(0, round(float(frow[0]))), round(float(frow[1])), w, h),
-                                embedding=emb,
-                                confidence=float(frow[14]),
-                                face_size_px=size,
-                                sharpness=sharp,
-                            )
-                        )
-
-                sampling = sample_video_frames(
-                    file_path, timestamps, on_frame=_on_frame, keep_debug_frames=False
-                )
-                if sampling.video_error is not None:
-                    continue
-                for tracklet in build_tracklets(
-                    frame_detections, frame_ms=[ts * 1000 for ts in timestamps]
-                ):
-                    rep = tracklet.representative_member()
-                    observations.append(
-                        ClusterableObservation(
-                            key=(str(file_path), "video_frame", rep.timestamp_ms, rep.bbox[0]),
-                            embedding=tracklet.representative_embedding(),
-                        )
-                    )
-                    file_of_obs.append((str(file_path), "video"))
-            except Exception as exc:  # noqa: BLE001 - one bad video never aborts the run
-                if not quiet:
-                    print(f"Suggest {file_path}: error: {exc}")
-                continue
-
-    clusters = cluster_people(observations, threshold=1.0 - similarity_threshold)
+    clusters = cluster_people(
+        observations, threshold=1.0 - similarity_threshold, linkage=linkage
+    )
     labels = assign_person_labels(clusters)
     candidates = suggest_merges(
         observations,
@@ -1047,6 +1071,7 @@ def run_person_suggest(
         file_of_obs,
         split_threshold=similarity_threshold,
         merge_floor=merge_floor,
+        weights=collected.weights,
     )
 
     print()
@@ -1063,6 +1088,132 @@ def run_person_suggest(
     print(f"suggestions={len(candidates)}")
     if candidates:
         print("Suggestions only - no changes made. Confirm with person-merge.")
+
+
+def _parse_float_grid(text: str, flag: str) -> list[float]:
+    """Parse a comma-separated float list CLI flag (calibration grids)."""
+    try:
+        values = [float(part) for part in text.split(",") if part.strip()]
+    except ValueError:
+        print(
+            f"ERROR: {flag} espera una lista de números separada por comas.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not values:
+        print(f"ERROR: {flag} no puede estar vacío.", file=sys.stderr)
+        raise SystemExit(1)
+    return values
+
+
+def run_person_calibrate(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    similarity_thresholds: list[float] | None = None,
+    merge_floors: list[float] | None = None,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    min_face_size: int = DEFAULT_MIN_FACE_SIZE_PX,
+    max_video_samples: int = 30,
+    linkage: str = LINKAGE_COMPLETE,
+    quiet: bool = False,
+) -> None:
+    """Score the (similarity-threshold, merge-floor) grid vs PERSON_XXXX (T2).
+
+    Read-only calibration: recomputes embeddings through the same
+    `_collect_face_observations` path as `run_cluster_people` and
+    `run_person_suggest` (memory-only — embeddings are recomputed, never
+    read from disk, never persisted, never printed), rebuilds clusters
+    for every similarity threshold, and scores each cell against the
+    human-curated canonical identities in the catalog
+    (`person_aliases`/`file_person_links` via
+    `person_identity.resolve_file_persons`, canonical `PERSON_XXXX`
+    only). Prints pairwise precision/recall/F0.5 plus singleton-rate,
+    cluster-count and suggestion-count per cell to stdout. Never writes
+    the database (the connection is closed without commit), never
+    changes the 0.50/0.40 defaults, never merges anything.
+    """
+    if not target.exists():
+        print(f"ERROR: la ruta no existe: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    if not target.is_dir():
+        print(f"ERROR: la ruta no es un directorio: {target}", file=sys.stderr)
+        raise SystemExit(1)
+    sims = (
+        list(similarity_thresholds)
+        if similarity_thresholds is not None
+        else [0.40, 0.45, 0.50, 0.55, 0.60]
+    )
+    floors = (
+        list(merge_floors)
+        if merge_floors is not None
+        else [0.30, 0.35, 0.40, 0.45]
+    )
+    for value in sims + floors:
+        if not 0.0 < value < 1.0:
+            print(
+                "ERROR: los umbrales de calibración deben estar en (0, 1).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    if linkage not in ("complete", "average"):
+        print(
+            "ERROR: linkage debe ser 'complete' o 'average'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    conn = database.connect(db_path)
+    try:
+        resolved = person_identity.resolve_file_persons(conn)
+    finally:
+        conn.close()  # read-only: no commit, no writes, ever.
+
+    collected = _collect_face_observations(
+        target,
+        confidence_threshold=confidence_threshold,
+        min_face_size=min_face_size,
+        max_video_samples=max_video_samples,
+        quiet=quiet,
+        log_prefix="Calibrate",
+        verbose_files=False,
+        include_details=False,
+    )
+    truth = threshold_calibration.build_observation_truth(
+        collected.file_of_obs, resolved
+    )
+    if not truth:
+        print(
+            "ERROR: ningún archivo del target tiene verdad PERSON_XXXX: "
+            "cura identidades con person-merge/person-assign primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    rows = threshold_calibration.sweep_grid(
+        collected.observations,
+        collected.file_of_obs,
+        collected.weights,
+        truth,
+        similarity_thresholds=sims,
+        merge_floors=floors,
+        linkage=linkage,
+    )
+    table = threshold_calibration.format_results_table(
+        rows,
+        observations=len(collected.observations),
+        labeled=len(truth),
+        ground_truth_persons=len({p for persons in truth.values() for p in persons}),
+        linkage=linkage,
+        default_similarity=DEFAULT_PERSON_SIMILARITY_THRESHOLD,
+        default_floor=DEFAULT_MERGE_FLOOR_SIMILARITY,
+    )
+    print(table, end="")
 
 
 def _require_catalog(conn, db_path: Path) -> None:
@@ -1951,7 +2102,12 @@ def build_parser() -> argparse.ArgumentParser:
     faces_parser.add_argument(
         "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
     )
-    faces_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    faces_parser.add_argument(
+        "--min-face-size",
+        type=int,
+        default=DEFAULT_MIN_FACE_SIZE_PX,
+        help=_MIN_FACE_SIZE_HELP,
+    )
     faces_parser.add_argument("--max-video-samples", type=int, default=30)
     faces_parser.add_argument("--redact-paths", action="store_true")
     faces_parser.add_argument("--verify-readonly", action="store_true")
@@ -1980,8 +2136,23 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_parser.add_argument(
         "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
     )
-    cluster_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    cluster_parser.add_argument(
+        "--min-face-size",
+        type=int,
+        default=DEFAULT_MIN_FACE_SIZE_PX,
+        help=_MIN_FACE_SIZE_HELP,
+    )
     cluster_parser.add_argument("--max-video-samples", type=int, default=30)
+    cluster_parser.add_argument(
+        "--linkage",
+        choices=("complete", "average"),
+        default="complete",
+        help=(
+            "Membership test against each cluster: 'complete' (default, "
+            "every member within threshold) or experimental 'average' "
+            "(mean member distance within threshold, merges more)."
+        ),
+    )
     cluster_parser.add_argument("--redact-paths", action="store_true")
     cluster_parser.add_argument("--verify-readonly", action="store_true")
     cluster_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
@@ -2198,9 +2369,68 @@ def build_parser() -> argparse.ArgumentParser:
     suggest_parser.add_argument(
         "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
     )
-    suggest_parser.add_argument("--min-face-size", type=int, default=DEFAULT_MIN_FACE_SIZE_PX)
+    suggest_parser.add_argument(
+        "--min-face-size",
+        type=int,
+        default=DEFAULT_MIN_FACE_SIZE_PX,
+        help=_MIN_FACE_SIZE_HELP,
+    )
     suggest_parser.add_argument("--max-video-samples", type=int, default=30)
+    suggest_parser.add_argument(
+        "--linkage",
+        choices=("complete", "average"),
+        default="complete",
+        help=(
+            "Cluster membership test reused from cluster-people: "
+            "'complete' (default) or experimental 'average'."
+        ),
+    )
     suggest_parser.add_argument("--quiet", action="store_true")
+
+    calibrate_parser = subparsers.add_parser(
+        "person-calibrate",
+        help=(
+            "Score the (similarity-threshold, merge-floor) grid against "
+            "curated PERSON_XXXX identities (read-only, reports only)."
+        ),
+    )
+    calibrate_parser.add_argument("target", type=Path, help="Ruta a escanear.")
+    calibrate_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    calibrate_parser.add_argument(
+        "--similarity-threshold",
+        type=str,
+        default=_DEFAULT_SIM_GRID,
+        help=(
+            "Comma-separated cosine-similarity grid to score "
+            f"(por defecto {_DEFAULT_SIM_GRID})."
+        ),
+    )
+    calibrate_parser.add_argument(
+        "--merge-floor",
+        type=str,
+        default=_DEFAULT_FLOOR_GRID,
+        help=(
+            "Comma-separated merge-floor grid (suggestion counts only; "
+            f"cluster metrics never depend on it) (por defecto {_DEFAULT_FLOOR_GRID})."
+        ),
+    )
+    calibrate_parser.add_argument(
+        "--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD
+    )
+    calibrate_parser.add_argument(
+        "--min-face-size",
+        type=int,
+        default=DEFAULT_MIN_FACE_SIZE_PX,
+        help=_MIN_FACE_SIZE_HELP,
+    )
+    calibrate_parser.add_argument("--max-video-samples", type=int, default=30)
+    calibrate_parser.add_argument(
+        "--linkage",
+        choices=("complete", "average"),
+        default="complete",
+        help="Cluster membership test scored in every cell.",
+    )
+    calibrate_parser.add_argument("--quiet", action="store_true")
 
     tag_parser = subparsers.add_parser(
         "tag",
@@ -2366,6 +2596,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             quiet=args.quiet,
             verify_readonly=args.verify_readonly,
             snapshot_dir=args.snapshot_dir,
+            linkage=args.linkage,
         )
     elif args.command == "organize-preview":
         run_organize_preview(
@@ -2446,6 +2677,21 @@ def main(argv: Optional[list[str]] = None) -> None:
             confidence_threshold=args.confidence_threshold,
             min_face_size=args.min_face_size,
             max_video_samples=args.max_video_samples,
+            quiet=args.quiet,
+            linkage=args.linkage,
+        )
+    elif args.command == "person-calibrate":
+        run_person_calibrate(
+            target=args.target,
+            db_path=args.db,
+            similarity_thresholds=_parse_float_grid(
+                args.similarity_threshold, "--similarity-threshold"
+            ),
+            merge_floors=_parse_float_grid(args.merge_floor, "--merge-floor"),
+            confidence_threshold=args.confidence_threshold,
+            min_face_size=args.min_face_size,
+            max_video_samples=args.max_video_samples,
+            linkage=args.linkage,
             quiet=args.quiet,
         )
     elif args.command == "tag":

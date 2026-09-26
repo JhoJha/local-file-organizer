@@ -1392,6 +1392,131 @@ class OrganizePreviewCliTests(unittest.TestCase):
         self.assertIn(f"- {p_active_doc}", printed)
 
 
+class PersonCalibrateCliTests(unittest.TestCase):
+    """End-to-end person-calibrate: mocked detector, hand-curated catalog."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.target = Path(self.tmpdir.name) / "target"
+        self.target.mkdir()
+        self.output_dir = Path(self.tmpdir.name) / "output"
+        self.output_dir.mkdir()
+        self.db_path = self.output_dir / "catalog.sqlite"
+
+    def _unit(self, angle_rad):
+        import math
+
+        import numpy as np
+
+        v = np.zeros(128, dtype=np.float32)
+        v[0] = math.cos(angle_rad)
+        v[1] = math.sin(angle_rad)
+        return v
+
+    def _row(self, x):
+        full = [0.0] * 15
+        full[0], full[1], full[2], full[3] = x, 5, 30, 30
+        full[14] = 0.9
+        return full
+
+    def _seed_truth(self, a_path, b_path):
+        from local_file_organizer import database
+
+        conn = database.connect(self.db_path)
+        database.insert_person_cluster_members(
+            conn, [("P0001", a_path, "image", 1), ("P0002", b_path, "image", 1)]
+        )
+        database.upsert_person(conn, "PERSON_0001", "Alice", "2026-01-01T00:00:00+00:00")
+        database.upsert_person(conn, "PERSON_0002", "Bob", "2026-01-01T00:00:00+00:00")
+        database.set_alias(conn, "P0001", "PERSON_0001", "2026-01-01T00:00:00+00:00")
+        database.set_alias(conn, "P0002", "PERSON_0002", "2026-01-01T00:00:00+00:00")
+        conn.commit()
+        conn.close()
+
+    def test_grid_reports_pairwise_metrics_against_truth(self):
+        import math
+
+        from unittest import mock
+
+        import numpy as np
+
+        from local_file_organizer import cli as cli_module
+        from local_file_organizer import database
+        from local_file_organizer.cli import run_person_calibrate
+
+        _save_gradient(self.target / "a.png")
+        _save_gradient(self.target / "b.png")
+        # a.png holds two identical rows (PERSON_0001, always together);
+        # b.png is 63 degrees away (PERSON_0002, sim ~0.454): merged at
+        # split 0.40, apart at 0.50.
+        emb_a, emb_b = self._unit(0.0), self._unit(math.radians(63))
+        rows_by_name = {
+            "a.png": np.array([self._row(10), self._row(12)], dtype=np.float32),
+            "b.png": np.array([self._row(50)], dtype=np.float32),
+        }
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, rows_by_name[Path(path).name], None)
+
+        def _fake_compute(img, row):
+            return emb_a if round(float(row[0])) in (10, 12) else emb_b
+
+        self._seed_truth(str(self.target / "a.png"), str(self.target / "b.png"))
+        before = database.fetch_aliases(database.connect(self.db_path))
+
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", side_effect=_fake_compute),
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                run_person_calibrate(
+                    self.target,
+                    db_path=self.db_path,
+                    similarity_thresholds=[0.40, 0.50],
+                    merge_floors=[0.30],
+                    quiet=True,
+                )
+        printed = output.getvalue()
+        self.assertIn("=== PERSON CALIBRATION ===", printed)
+        self.assertIn("observations=3 labeled=3 unlabeled=0", printed)
+        self.assertIn("ground_truth_persons=2", printed)
+        # Loose cell: all three in one cluster -> P=1/3, R=1.0, F0.5~0.385.
+        self.assertIn("0.40 0.30 0.333 1.000 0.385 0.000 1 0", printed)
+        # Strict cell: perfect split, one in-band suggestion.
+        self.assertIn("0.50 0.30 1.000 1.000 1.000 0.500 2 1", printed)
+        self.assertIn("defaults: similarity_threshold=0.50 merge_floor=0.40", printed)
+
+        # Read-only: the catalog curation is untouched, and no embedding
+        # vector ever reaches stdout.
+        after = database.fetch_aliases(database.connect(self.db_path))
+        self.assertEqual(before, after)
+
+    def test_no_ground_truth_exits_with_guidance(self):
+        from local_file_organizer import database
+        from local_file_organizer.cli import run_person_calibrate
+
+        _save_gradient(self.target / "a.png")
+        database.connect(self.db_path).close()  # catalog exists, zero curation
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                run_person_calibrate(self.target, db_path=self.db_path, quiet=True)
+        self.assertIn("PERSON_XXXX", err.getvalue())
+
+    def test_missing_catalog_exits(self):
+        from local_file_organizer.cli import run_person_calibrate
+
+        _save_gradient(self.target / "a.png")
+        with self.assertRaises(SystemExit):
+            run_person_calibrate(
+                self.target,
+                db_path=self.output_dir / "missing.sqlite",
+                quiet=True,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 

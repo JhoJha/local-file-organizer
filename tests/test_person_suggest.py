@@ -18,6 +18,7 @@ from local_file_organizer.face_clustering import (
 )
 from local_file_organizer.person_suggest import (
     DEFAULT_MERGE_FLOOR_SIMILARITY,
+    _centroid,
     suggest_merges,
 )
 
@@ -171,6 +172,64 @@ class CliTests(unittest.TestCase):
             "python -m local_file_organizer person-merge P0001 P0002", printed
         )
         self.assertIn("suggestions=1", printed)
+
+
+class WeightedCentroidTests(unittest.TestCase):
+    def test_weighted_centroid_follows_heavy_member(self):
+        a, b = _unit(0.0), _unit(math.radians(60))
+        expected = (3.0 * a + 1.0 * b) / 4.0
+        np.testing.assert_allclose(
+            _centroid([a, b], weights=[3.0, 1.0]), expected, rtol=1e-9
+        )
+
+    def test_uniform_or_missing_weights_match_plain_mean(self):
+        a, b = _unit(0.0), _unit(math.radians(60))
+        plain = _centroid([a, b])
+        np.testing.assert_array_equal(_centroid([a, b], weights=[2.0, 2.0]), plain)
+        np.testing.assert_array_equal(
+            _centroid([a, b], weights=[1.0, 0.0, -1.0]), plain
+        )
+
+    def test_zero_norm_still_returns_none(self):
+        v = np.zeros(128, dtype=np.float64)
+        self.assertIsNone(_centroid([v, -v.copy()]))
+        self.assertIsNone(_centroid([v, -v.copy()], weights=[3.0, 1.0]))
+
+    def test_suggest_with_uniform_weights_matches_unweighted(self):
+        a, b = _unit(0.0), _unit(math.radians(63))  # sim ~0.454
+        observations, clusters, labels, file_of_obs = _clustered(
+            [a, b], ["/a.jpg", "/b.jpg"]
+        )
+        plain = suggest_merges(
+            observations, clusters, labels, file_of_obs,
+            split_threshold=SPLIT, merge_floor=FLOOR,
+        )
+        weighted = suggest_merges(
+            observations, clusters, labels, file_of_obs,
+            split_threshold=SPLIT, merge_floor=FLOOR,
+            weights=[5.0, 5.0],
+        )
+        self.assertEqual(plain, weighted)
+
+    def test_suggest_with_weights_stays_deterministic_and_ordered(self):
+        v0 = _unit(0.0)
+        v1 = _unit(math.radians(61))
+        v2 = _unit(math.radians(-63))
+        observations, clusters, labels, file_of_obs = _clustered(
+            [v0, v1, v2], ["/a.jpg", "/b.jpg", "/c.jpg"]
+        )
+        weights = [100.0, 1.0, 50.0]
+        first = suggest_merges(
+            observations, clusters, labels, file_of_obs,
+            split_threshold=SPLIT, merge_floor=FLOOR, weights=weights,
+        )
+        second = suggest_merges(
+            observations, clusters, labels, file_of_obs,
+            split_threshold=SPLIT, merge_floor=FLOOR, weights=weights,
+        )
+        self.assertEqual(first, second)
+        sims = [c.mean_similarity for c in first]
+        self.assertEqual(sims, sorted(sims, reverse=True))
 
 
 if __name__ == "__main__":

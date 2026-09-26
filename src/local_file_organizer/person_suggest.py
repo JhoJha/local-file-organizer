@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .face_clustering import DEFAULT_SIMILARITY_THRESHOLD
-from .face_embedding import cosine_distance
+from .face_embedding import cosine_distance, weighted_mean
 
 # Pairwise cluster similarity metric used for suggestions.
 SUGGEST_SIMILARITY_METRIC = "centroid_cosine"
@@ -54,10 +54,20 @@ class MergeCandidate:
         return f"python -m local_file_organizer person-merge {self.label_a} {self.label_b}"
 
 
-def _centroid(embeddings: list[np.ndarray]) -> np.ndarray | None:
-    """Mean embedding, or None when it has zero norm (unmeasurable)."""
+def _centroid(embeddings: list[np.ndarray], weights=None) -> np.ndarray | None:
+    """Mean embedding, or None when it has zero norm (unmeasurable).
+
+    Quality weighting (T2): `weights` is one non-negative float per
+    embedding (confidence*size*sharpness from the ingestion gate; the
+    CLI passes one per observation). `None` or uniform weights take the
+    exact pre-T2 plain-mean path; invalid weights fall back to it (see
+    `face_embedding.weighted_mean`). Similarity math is untouched: the
+    centroid is still the raw (non-normalized) mean — `cosine_distance`
+    normalizes internally, so rankings only shift because low-quality
+    observations now steer the centroid less, which is the intended fix.
+    """
     stacked = np.stack([np.asarray(e, dtype=np.float64).reshape(-1) for e in embeddings])
-    mean = stacked.mean(axis=0)
+    mean = weighted_mean(stacked, weights)
     if float(np.linalg.norm(mean)) == 0.0:
         return None
     return mean
@@ -70,18 +80,28 @@ def suggest_merges(
     file_of_obs: list[tuple[str, str]],
     split_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     merge_floor: float = DEFAULT_MERGE_FLOOR_SIMILARITY,
+    weights: list[float] | None = None,
 ) -> list[MergeCandidate]:
     """List candidate merges inside [merge_floor, split_threshold).
 
     Deterministic: candidates are sorted by similarity descending, then
     by (label_a, label_b). Pairs that already merged (at/above split)
-    or are too dissimilar (below floor) are absent.
+    or are too dissimilar (below floor) are absent. `weights` (one
+    quality weight per observation, `None` = plain centroids) is sliced
+    per cluster and forwarded to `_centroid`; a length mismatch falls
+    back to plain centroids. The band math and the ordering are
+    identical either way.
     """
     if len(clusters) < 2:
         return []
+    if weights is not None and len(weights) != len(observations):
+        weights = None
     centroids: dict[int, np.ndarray] = {}
     for number, idxs in enumerate(clusters):
-        centroid = _centroid([observations[i].embedding for i in idxs])
+        cluster_weights = None if weights is None else [weights[i] for i in idxs]
+        centroid = _centroid(
+            [observations[i].embedding for i in idxs], weights=cluster_weights
+        )
         if centroid is not None:
             centroids[number] = centroid
     cluster_labels = [labels[clusters[n][0]] for n in range(len(clusters))]

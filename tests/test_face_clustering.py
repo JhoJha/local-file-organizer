@@ -152,5 +152,43 @@ class ThresholdSensitivityTests(unittest.TestCase):
         self.assertEqual(len(middle), 2)  # partial merge
 
 
+class LinkageTests(unittest.TestCase):
+    def test_default_linkage_is_complete(self):
+        import inspect
+
+        self.assertEqual(
+            inspect.signature(cluster_people).parameters["linkage"].default,
+            "complete",
+        )
+
+    def test_complete_and_average_agree_on_clear_cases(self):
+        v = _unit_on_circle(0.3)
+        observations = [_obs((k,), v.copy()) for k in ("a", "b", "c")]
+        for linkage in ("complete", "average"):
+            clusters = cluster_people(observations, threshold=0.5, linkage=linkage)
+            self.assertEqual(len(clusters), 1)
+
+    def test_average_joins_when_only_mean_is_within_threshold(self):
+        # a=0deg, b=30deg (same cluster, dist 0.134); c=70deg is
+        # 0.658 from a but 0.234 from b: complete-linkage vetoes on the
+        # far member (2 clusters), average-linkage joins on the mean
+        # distance 0.446 (1 cluster).
+        observations = [
+            _obs(("a",), _unit_on_circle(0.0)),
+            _obs(("b",), _unit_on_circle(math.radians(30))),
+            _obs(("c",), _unit_on_circle(math.radians(70))),
+        ]
+        complete = cluster_people(observations, threshold=0.5, linkage="complete")
+        self.assertEqual(len(complete), 2)
+        average = cluster_people(observations, threshold=0.5, linkage="average")
+        self.assertEqual(len(average), 1)
+        self.assertEqual(sorted(average[0]), [0, 1, 2])
+
+    def test_invalid_linkage_raises(self):
+        observations = [_obs(("a",), _unit_on_circle(0.0))]
+        with self.assertRaises(ValueError):
+            cluster_people(observations, threshold=0.5, linkage="single")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,15 @@ from .face_embedding import cosine_distance
 # for fewer wrongful merges, which is the explicitly desired direction.
 DEFAULT_SIMILARITY_THRESHOLD = 0.50
 
+# Linkage criteria supported by `cluster_people` (T2). "complete" is the
+# historical behavior and the default; "average" is an experimental flag
+# only — it joins the first cluster whose MEAN member distance is within
+# threshold (more forgiving of one outlier member, at the cost of the
+# strict anti-transitive guarantee documented in the module docstring).
+# No other value is accepted (ValueError).
+LINKAGE_COMPLETE = "complete"
+LINKAGE_AVERAGE = "average"
+
 
 @dataclass
 class ClusterableObservation:
@@ -48,6 +57,7 @@ class ClusterableObservation:
 def cluster_people(
     observations: list[ClusterableObservation],
     threshold: float = 1.0 - DEFAULT_SIMILARITY_THRESHOLD,
+    linkage: str = LINKAGE_COMPLETE,
 ) -> list[list[int]]:
     """Greedy complete-linkage clustering over cosine distance.
 
@@ -55,12 +65,25 @@ def cluster_people(
     converted from the cosine-similarity CLI flag by the caller
     (`distance = 1.0 - similarity`).
 
+    `linkage` selects the membership test against each existing cluster:
+    "complete" (default, historical behavior) joins only when *every*
+    current member is within threshold; "average" (experimental) joins
+    when the *mean* member distance is within threshold. "average" merges
+    more aggressively — one far member no longer vetoes — so it weakens
+    the anti-transitive guarantee above; calibrate any threshold change
+    with `person-calibrate` before trusting it. Anything else raises
+    ValueError.
+
     Returns a list of clusters, each a list of indices into
     `observations`, sorted deterministically (see below). Every
     observation belongs to exactly one cluster, including size-1 clusters
     (unlike perceptual_hash's group_similar_images, which drops
     singletons).
     """
+    if linkage not in (LINKAGE_COMPLETE, LINKAGE_AVERAGE):
+        raise ValueError(
+            f"linkage desconocido: {linkage!r} (usa 'complete' o 'average')"
+        )
     n = len(observations)
     if n == 0:
         return []
@@ -72,14 +95,18 @@ def cluster_people(
     for idx in order:
         placed = False
         for cluster in clusters:
-            if all(
+            distances = [
                 cosine_distance(
                     observations[idx].embedding,
                     observations[member].embedding,
                 )
-                <= threshold
                 for member in cluster
-            ):
+            ]
+            if linkage == LINKAGE_AVERAGE:
+                join = sum(distances) / len(distances) <= threshold
+            else:
+                join = all(d <= threshold for d in distances)
+            if join:
                 cluster.append(idx)
                 placed = True
                 break
@@ -105,6 +132,8 @@ def assign_person_labels(clusters: list[list[int]]) -> dict[int, str]:
 __all__ = [
     "ClusterableObservation",
     "DEFAULT_SIMILARITY_THRESHOLD",
+    "LINKAGE_AVERAGE",
+    "LINKAGE_COMPLETE",
     "assign_person_labels",
     "cluster_people",
 ]

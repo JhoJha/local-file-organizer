@@ -201,5 +201,100 @@ class TrackletClusteringEndToEndTests(unittest.TestCase):
         self.assertEqual(len(cluster_people(reps, threshold=0.5)), 1)
 
 
+class WeightedRepresentativeTests(unittest.TestCase):
+    def test_none_derives_quality_weights(self):
+        # weights=None weighs by member quality: the representative leans
+        # toward the sharp/large/confident frame, away from the plain mean.
+        low = _face(
+            1000.0,
+            embedding=_unit_on_circle(0.0),
+            confidence=0.9,
+            face_size_px=900.0,
+            sharpness=5.0,
+        )
+        high = _face(
+            2000.0,
+            embedding=_unit_on_circle(math.radians(60)),
+            confidence=0.9,
+            face_size_px=900.0,
+            sharpness=50.0,
+        )
+        tracklets = build_tracklets([low, high])
+        self.assertEqual(len(tracklets), 1)
+        rep = tracklets[0].representative_embedding()
+        plain = (
+            low.embedding.astype(np.float64) + high.embedding.astype(np.float64)
+        ) / 2
+        plain = plain / np.linalg.norm(plain)
+        # Representative is closer (higher cosine similarity) to the
+        # high-quality member than the plain mean is.
+        self.assertGreater(float(rep @ high.embedding), float(plain @ high.embedding))
+        self.assertLess(float(rep @ low.embedding), float(plain @ low.embedding))
+
+    def test_uniform_explicit_weights_reproduce_plain_mean_exactly(self):
+        # T2 acceptance: uniform weights -> the old mean, bit for bit,
+        # even when member qualities differ.
+        low = _face(
+            1000.0,
+            embedding=_unit_on_circle(0.0),
+            confidence=0.9,
+            face_size_px=900.0,
+            sharpness=5.0,
+        )
+        high = _face(
+            2000.0,
+            embedding=_unit_on_circle(math.radians(60)),
+            confidence=0.9,
+            face_size_px=900.0,
+            sharpness=50.0,
+        )
+        tracklets = build_tracklets([low, high])
+        rep = tracklets[0].representative_embedding(weights=[2.0, 2.0])
+        mean = (
+            low.embedding.astype(np.float64) + high.embedding.astype(np.float64)
+        ) / 2
+        expected = (mean / np.linalg.norm(mean)).astype(np.float32)
+        np.testing.assert_array_equal(rep, expected)
+
+    def test_invalid_weights_fall_back_to_plain_mean(self):
+        faces = [
+            _face(1000.0, embedding=_unit_on_circle(0.0), confidence=0.9),
+            _face(2000.0, embedding=_unit_on_circle(math.radians(20)), confidence=0.9),
+        ]
+        tracklet = build_tracklets(faces)[0]
+        expected = tracklet.representative_embedding(weights=[1.0, 1.0])
+        for bad in ([1.0], [1.0, -1.0], [0.0, 0.0], [float("nan"), 1.0]):
+            np.testing.assert_array_equal(
+                tracklet.representative_embedding(weights=bad), expected
+            )
+
+    def test_zero_weight_member_is_ignored(self):
+        # A zero weight is valid (not a fallback): the representative is
+        # the L2-normalized surviving member.
+        faces = [
+            _face(1000.0, embedding=_unit_on_circle(0.0), confidence=0.9),
+            _face(2000.0, embedding=_unit_on_circle(math.radians(20)), confidence=0.9),
+        ]
+        tracklet = build_tracklets(faces)[0]
+        rep = tracklet.representative_embedding(weights=[0.0, 3.0])
+        np.testing.assert_allclose(
+            rep, faces[1].embedding.astype(np.float32), rtol=1e-5
+        )
+
+    def test_weighted_representative_stays_unit_norm(self):
+        faces = [
+            _face(
+                1000.0 * (i + 1),
+                embedding=_unit_on_circle(math.radians(10 * i)),
+                confidence=0.5 + 0.1 * i,
+                face_size_px=900.0,
+                sharpness=5.0 * (i + 1),
+            )
+            for i in range(3)
+        ]
+        rep = build_tracklets(faces)[0].representative_embedding()
+        self.assertAlmostEqual(float(np.linalg.norm(rep)), 1.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()

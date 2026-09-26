@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 
-from .face_embedding import cosine_distance
+from .face_embedding import cosine_distance, weighted_mean
 
 # Minimum cosine SIMILARITY between a detection and a tracklet's last
 # member to allow linking. Deliberately the same strictness (0.50) as
@@ -53,10 +53,15 @@ class FrameFace:
     embedding: np.ndarray  # (128,) float32, never persisted
     confidence: float
     # Quality fields, populated by the ingestion quality gate
-    # (face_detection.passes_quality_gate): box area (w*h) in px and
+    # (face_detection.passes_quality_gate): box AREA (w*h) in px and
     # Laplacian-variance sharpness of the ROI. They default to 0.0 so
     # callers without quality info (older tests, synthetic fixtures)
     # keep working: `quality` then falls back to plain confidence.
+    # Naming note (R2-001): `face_size_px` is a box AREA (w*h, in px^2),
+    # not a side length — it compares against nothing, it only feeds the
+    # quality product below. The side-length gate is `min_face_size_px`
+    # (each of w/h must clear it) in face_detection/cli. The historic
+    # field name is kept for backward compatibility.
     face_size_px: float = 0.0
     sharpness: float = 0.0
     # Best-frame score: confidence*size*sharpness when quality info is
@@ -81,7 +86,7 @@ class Tracklet:
 
     members: list[FrameFace] = field(default_factory=list)
 
-    def representative_embedding(self) -> np.ndarray:
+    def representative_embedding(self, weights=None) -> np.ndarray:
         """L2-normalized mean embedding of the members (float32).
 
         Averaging same-face observations denoises per-frame jitter; the
@@ -92,11 +97,26 @@ class Tracklet:
         magnitudes comparable for the downstream clustering. A
         zero-norm mean (degenerate all-zero members) cannot be
         normalized and is returned as-is.
+
+        Quality weighting (T2): `weights=None` (the default) derives one
+        weight per member from `quality` (confidence*size*sharpness when
+        the ingestion gate populated it, else plain confidence), so
+        sharp, large, confident frames steer the representative and
+        blurry marginal frames count less. An explicit `weights` list
+        (one non-negative float per member) overrides that; uniform
+        explicit weights reproduce the old plain mean exactly (same code
+        path, bit for bit). Invalid weights (wrong length, non-finite,
+        negative, all-zero) fall back to the plain mean.
         """
         stacked = np.stack(
             [np.asarray(m.embedding, dtype=np.float64) for m in self.members]
         )
-        mean = stacked.mean(axis=0)
+        if weights is None:
+            weights = [
+                m.quality if m.quality is not None else m.confidence
+                for m in self.members
+            ]
+        mean = weighted_mean(stacked, weights)
         norm = float(np.linalg.norm(mean))
         if norm == 0.0 or not np.isfinite(norm):
             return np.asarray(mean, dtype=np.float32)

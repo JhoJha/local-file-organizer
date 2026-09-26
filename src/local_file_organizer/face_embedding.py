@@ -74,6 +74,32 @@ def compute_embedding(
         return None
 
 
+def weighted_mean(embeddings_2d: np.ndarray, weights=None) -> np.ndarray:
+    """Row-wise mean of a (n, d) float64 stack, optionally quality-weighted.
+
+    `weights=None` — or weights that are all equal, or invalid (wrong
+    length, non-finite, any negative, non-positive sum) — takes the plain
+    arithmetic mean through the exact pre-T2 code path, bit for bit, so
+    uniform weights reproduce the old centroid exactly. Otherwise the
+    quality-weighted mean sum(w_i * e_i) / sum(w_i). Fully deterministic
+    (no randomness, input order preserved).
+    """
+    n = embeddings_2d.shape[0]
+    if weights is None:
+        return embeddings_2d.mean(axis=0)
+    w = np.asarray(list(weights), dtype=np.float64).reshape(-1)
+    if w.shape != (n,) or not bool(np.all(np.isfinite(w))):
+        return embeddings_2d.mean(axis=0)
+    if bool(np.any(w < 0.0)):
+        return embeddings_2d.mean(axis=0)
+    total = float(w.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        return embeddings_2d.mean(axis=0)
+    if bool(np.all(w == w[0])):
+        return embeddings_2d.mean(axis=0)
+    return (embeddings_2d * w[:, None]).sum(axis=0) / total
+
+
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine distance `1 - dot(a,b)/(norm(a)*norm(b))`.
 

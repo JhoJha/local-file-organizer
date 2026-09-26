@@ -502,6 +502,44 @@ tracklet es el mejor frame por calidad
 (`confianza × tamaño × nitidez`, con desempate determinista por
 `timestamp_ms` y bbox), no simplemente la mayor confianza.
 
+### Centroide ponderado por calidad y calibración (T2)
+
+El representante de cada tracklet y el centroide de cada cluster de
+`suggest` son medias **ponderadas por calidad**
+(`confianza × tamaño × nitidez` por observación; en tracklets de video,
+la suma de calidades de sus miembros): los frames nítidos y grandes
+tiran más del centroide y los marginales pesan menos. Con pesos
+uniformes la media ponderada reproduce bit a bit la media simple
+anterior. Los sitios de imagen ya no descartan tamaño/nitidez: los
+usan como peso de calidad igual que los de video.
+
+`cluster-people` y `person-suggest` aceptan `--linkage`: `complete`
+(por defecto, comportamiento histórico — un candidato solo entra si
+**todos** los miembros están dentro del umbral) o `average`
+(experimental — basta con que la **distancia media** esté dentro;
+fusiona más, garantía anti-transitiva más débil).
+
+`person-calibrate` barre una grilla de `--similarity-threshold` y
+`--merge-floor` y puntúa cada celda contra las identidades curadas
+`PERSON_XXXX` del catálogo (precisión/recall/F0.5 por pares, tasa de
+singletons, conteo de clusters y sugerencias). Es solo lectura: recomputa
+embeddings en memoria por el mismo camino que `cluster-people`, nunca
+persiste vectores ni etiquetas, nunca toca la base y nunca cambia los
+defaults 0.50/0.40 — solo reporta. Sin curación (`PERSON_XXXX`) no hay
+verdad contra la cual calibrar y el comando lo dice y aborta.
+
+```bash
+python -m local_file_organizer person-calibrate /ruta/a/analizar
+python -m local_file_organizer person-calibrate /ruta/a/analizar \
+  --similarity-threshold 0.45,0.50,0.55 --merge-floor 0.35,0.40
+```
+
+Nota de nombres (R2-001): `--min-face-size` es un **largo de lado**
+mínimo en px (sobrevive solo si **ambos** lados w/h lo superan); el
+peso de calidad `face_size_px` es en cambio el **área** w×h del recorte.
+Son magnitudes distintas con nombres parecidos por compatibilidad
+histórica — la ayuda de cada flag y los docstrings lo aclaran.
+
 ### Etiquetas anónimas y qué se guarda
 
 Cada cluster recibe una etiqueta anónima `P0001`, `P0002`, … (asignación

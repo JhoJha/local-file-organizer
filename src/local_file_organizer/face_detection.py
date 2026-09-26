@@ -21,6 +21,9 @@ MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 DEFAULT_NMS_THRESHOLD = 0.3
 DEFAULT_TOP_K = 5000
+# Side length in px (R2-001: this is a SIDE, not an area — a detection
+# survives only when BOTH box sides clear it; the w*h box AREA is the
+# separate `face_size_px` quality weight in face_tracking).
 DEFAULT_MIN_FACE_SIZE_PX = 20
 
 # Minimum face-ROI sharpness (variance of the Laplacian over the
