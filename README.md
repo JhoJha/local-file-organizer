@@ -43,10 +43,12 @@ servicios en la nube ni usa IA generativa.
     [Revisión de clusters de personas
     (V2.4.1)](#revisión-de-clusters-de-personas-v241).
 14. (V2.5.1) `organize-preview` simula una estructura de carpetas sin
-    tocar nada, con niveles de confianza `high`/`medium`/`low` y enrutado
-    conservador a `Revisión/` — ver
-    [Vista previa de organización con confianza
-    (V2.5.1)](#vista-previa-de-organización-con-confianza-v251).
+tocar nada, con niveles de confianza `high`/`medium`/`low` y enrutado
+conservador a `Revisión/` — ver
+[Vista previa de organización con confianza
+(V2.5.1)](#vista-previa-de-organización-con-confianza-v251). Los
+movimientos reales viven en `organize-apply` (V2.6, dry-run por defecto
+con rollback).
 15. (V3.0) `scan` enriquece imágenes y videos con EXIF/XMP vía ExifTool
     del sistema (fecha de captura, dispositivo, GPS, orientación) — ver
     [Enriquecimiento EXIF (V3.0)](#enriquecimiento-exif-v30).
@@ -66,12 +68,13 @@ servicios en la nube ni usa IA generativa.
 
 ## Qué NO hace (por diseño)
 
-No mueve, copia, renombra ni borra archivos; no modifica metadatos ni
-timestamps originales; no usa IA generativa ni APIs externas; no sube nada
-a la nube; no hace identificación de personas reales: V2.4 agrupa caras en
-etiquetas anónimas de cluster (`P0001`, `P0002`, …) sin nombres ni
-búsquedas contra nada externo — solo quién-aparece-dónde, nunca quién-es;
-no reorganiza carpetas.
+No copia, renombra fuera de `organize-apply`, ni borra archivos; no
+modifica metadatos ni timestamps originales; no usa IA generativa ni APIs
+externas; no sube nada a la nube; no hace identificación de personas
+reales: V2.4 agrupa caras en etiquetas anónimas de cluster (`P0001`,
+`P0002`, …) sin nombres ni búsquedas contra nada externo — solo
+quién-aparece-dónde, nunca quién-es; no reorganiza carpetas salvo vía el
+`organize-apply` explícito de V2.6 (dry-run por defecto, con rollback).
 
 ## Requisitos
 
@@ -118,6 +121,8 @@ python -m local_file_organizer tag /ruta/foto.jpg beach
 python -m local_file_organizer tags
 python -m local_file_organizer search --category video --person PERSON_0001 --min-duration 600
 python -m local_file_organizer search --tag beach --tag family
+python -m local_file_organizer organize-apply /ruta/a/organizar
+python -m local_file_organizer organize-rollback --manifest reports/apply_manifest_<ts>.json --apply
 ```
 
 Opciones de `scan`:
@@ -220,11 +225,15 @@ personales reales.
 ## Garantías de seguridad
 
 - Todo lo que el programa escribe vive bajo `data/` y `reports/` dentro de
-  este repositorio.
+  este repositorio — salvo los movimientos del propio `organize-apply`,
+  que operan solo dentro del target explícito (ver abajo).
 - El código fuente no contiene llamadas a `os.remove`, `os.unlink`,
-  `os.rmdir`, `os.rename`, `os.replace`, `shutil.move`, `shutil.copy` ni
+  `os.rmdir`, `os.replace`, `shutil.move`, `shutil.copy` ni
   `shutil.copy2` dirigidas a la carpeta analizada — ver
-  `tests/test_safety_gate.py`.
+  `tests/test_safety_gate.py`. La única excepción deliberada es
+  `os.rename` en `src/local_file_organizer/organize_apply.py` (movimientos
+  de `organize-apply`/`organize-rollback`, siempre dentro del target
+  explícito, nunca sobrescribiendo, nunca borrando).
 - Nunca se invoca `sudo` ni se cambian permisos automáticamente; los
   errores de lectura se registran y el escaneo continúa.
 - `local_file_organizer.snapshot` permite capturar y comparar snapshots
@@ -703,8 +712,8 @@ SQLite existente (`files`, columnas `duplicate_group`/`similar_group`, y
 `person_cluster_members`) más las decisiones humanas de V2.4.1, y escribe
 `reports/organization_plan.json`, sin recorrer el sistema de archivos ni
 mover, copiar, renombrar o borrar nada (`moved=0, copied=0, renamed=0,
-deleted=0`). No existe ningún `organize-apply` todavía: los movimientos
-reales son trabajo futuro explícito (V2.6, no implementado).
+deleted=0`). Los movimientos reales los ejecuta `organize-apply` (V2.6),
+siempre dry-run salvo `--apply` explícito.
 
 El principio rector es preferir un falso negativo (mandar a `Revisión/`)
 antes que un falso positivo (asignar el archivo a la persona incorrecta).
@@ -814,6 +823,44 @@ Limitación conocida: una imagen/video que nunca pasó por
 cae en `Media/Sin_personas/`, no en `Revisión/`: "cero caras confirmadas"
 y "nunca analizado" son indistinguibles en este hito.
 
+## Organize apply with dry-run default and rollback (V2.6)
+
+`organize-apply` executes the plan from `reports/organization_plan.json`
+against an explicit target root. It is dry-run by default: without
+`--apply` (or `--yes`) it only prints what it would do and changes
+nothing (no manifest, no snapshots).
+
+```bash
+python -m local_file_organizer organize-apply /path/to/root
+python -m local_file_organizer organize-apply /path/to/root --apply
+python -m local_file_organizer organize-apply /path/to/root --apply --include-review
+python -m local_file_organizer organize-rollback --manifest reports/apply_manifest_<ts>.json --apply
+```
+
+Flags: `--db`, `--plan-path`, `--apply` / `--yes` (explicit confirmation
+for the real run), `--include-review` (also move `review`/`unsupported`
+buckets, skipped by default), `--snapshot-dir`, `--manifest-path`
+(default `<plan-dir>/apply_manifest_<ts>.json`).
+
+Safety rules: every source and destination must stay inside the explicit
+target root (anything outside refuses the whole run before moving
+anything); the plan must match the active catalog exactly (count and
+`F000NNN` order, otherwise regenerate with `organize-preview`); entries
+with bucket `review`/`unsupported` are skipped unless `--include-review`
+is given; destinations are never overwritten — an existing destination
+with different bytes, a symlink, or a directory is an error, not an
+overwrite (byte-identical destinations are skipped); nothing is ever
+deleted (only moves via rename, plus creating destination directories);
+snapshot and manifest outputs inside the target root are refused.
+
+Proof and rollback: every real run writes before/after snapshots
+(`--verify-readonly`-style proof) under `data/snapshots/` plus a rollback
+manifest (`reports/apply_manifest_<ts>.json`) with opaque ids, source and
+destination paths, and SHA-256 checksums. The command prints the exact
+`organize-rollback --manifest ... --apply` invocation to undo. Rollback
+checksum-verifies every location first and refuses the whole undo on any
+mismatch. Reports show paths relative to the target root.
+
 ## Frontera de privacidad (futuro)
 
 Esta V1 no se conecta a ningún proveedor externo. Se documenta aquí, de
@@ -864,8 +911,10 @@ tipo en esta V1, y no debe añadirse hasta que sea necesaria.
   vista previa; singletons y evidencia débil a `Revisión/`
   (`Baja_evidencia/`, `Persona_incierta/`, `Cluster_rechazado/`), override
   humano de V2.4.1 vía `--decisions` y bloques `DESTINATIONS`/`CONFIDENCE`.
-- V2.6 (no implementado): `organize-apply`, movimientos reales con
-  dry-run/rollback; no existe todavía.
+- V2.6 (implementado): `organize-apply`, movimientos reales con
+  dry-run por defecto, snapshots before/after, manifiesto de rollback y
+  `organize-rollback` para deshacer; el gate de seguridad cubre el nuevo
+  módulo con allowlist explícita.
 - V3: parsing de documentos, OCR local, clasificación documental.
 - V4: búsqueda local, consultas SQLite, embeddings locales.
 - V5: `plan.json`, dry-run de movimientos, apply, rollback.

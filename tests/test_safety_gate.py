@@ -36,6 +36,17 @@ FORBIDDEN_PATTERNS = [
 # use os.replace, and only for that atomic local JSON write.
 ALLOWED_REPLACE_FILES = {"face_review.py"}
 
+# organize_apply.py is the single module allowed to use os.rename, and only
+# to relocate files strictly inside an explicit user-supplied target root:
+# dry-run by default (no mutation without --apply), pre-flight refusal on
+# any source/destination outside the root, review/unsupported buckets gated
+# behind --include-review, destinations never overwritten (collisions and
+# symlinks are errors), nothing ever deleted, and every real run writes a
+# rollback manifest plus before/after snapshots outside the target root.
+# This allowlist entry is the deliberate T3 (organize-apply) extension of
+# the gate: do not add other files without the same level of justification.
+ALLOWED_RENAME_FILES = {"organize_apply.py"}
+
 
 class SafetyGateTests(unittest.TestCase):
     def test_no_destructive_or_write_operations_in_source(self):
@@ -49,6 +60,11 @@ class SafetyGateTests(unittest.TestCase):
                 if (
                     pattern == r"\bos\.replace\s*\("
                     and path.name in ALLOWED_REPLACE_FILES
+                ):
+                    continue
+                if (
+                    pattern == r"\bos\.rename\s*\("
+                    and path.name in ALLOWED_RENAME_FILES
                 ):
                     continue
                 for match in re.finditer(pattern, text):
@@ -69,12 +85,19 @@ class SafetyGateTests(unittest.TestCase):
         # path supplied by the CLI (defaulting to this project's own data/
         # and reports/ directories), never to the scanned tree. Every other
         # module may only *read* (stat, open for reading, hash).
+        #
+        # organize_apply.write_manifest() is allowlisted alongside them as
+        # the deliberate T3 extension: it writes only the rollback manifest
+        # JSON to a caller-supplied path that is refused when inside the
+        # target root (see _check_output_locations). File relocations use
+        # os.rename under ALLOWED_RENAME_FILES above, never write calls.
         allowed_write_files = {
             "database.py",
             "reporting.py",
             "snapshot.py",
             "organization_plan.py",
             "face_review.py",
+            "organize_apply.py",
         }
         write_call_patterns = [
             r"open\(([^)]*)\)",

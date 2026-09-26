@@ -1154,6 +1154,141 @@ def run_organize_preview(
         print(f"View: {_display_path(result.view_path)}")
 
 
+def _relative_to_root(path: Path, root: Path) -> str:
+    """Render an in-target path relative to the target root for reports."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def run_organize_apply(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    plan_path: Path = DEFAULT_PLAN_PATH,
+    apply: bool = False,
+    include_review: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+    manifest_path: Path | None = None,
+) -> None:
+    """Move files per the organization plan (dry-run unless ``apply``).
+
+    Without ``apply`` this only prints what a real run would do and changes
+    nothing (no manifest, no snapshots). With ``apply`` it validates the
+    whole plan first (target-root containment, desync, collisions), takes
+    before/after snapshots plus a rollback manifest, and only then moves.
+    Entries with bucket ``review``/``unsupported`` are skipped unless
+    ``include_review`` is set. Any refusal aborts before moving anything.
+    """
+    from . import organize_apply as apply_mod
+
+    if not apply:
+        try:
+            preview = apply_mod.plan_apply_dry_run(
+                target=target,
+                db_path=db_path,
+                plan_path=plan_path,
+                include_review=include_review,
+            )
+        except apply_mod.OrganizeApplyError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        print()
+        print("=== ORGANIZE APPLY (DRY RUN) ===")
+        for move in preview.moves:
+            print(
+                f"{move.file_id} "
+                f"{_relative_to_root(move.src, preview.target_root)} -> "
+                f"{_relative_to_root(move.dst, preview.target_root)}"
+            )
+        print(f"would_move={len(preview.moves)}")
+        print(f"skipped_review={len(preview.skipped_review)}")
+        print(f"existing_destinations={len(preview.existing_destinations)}")
+        print(f"missing_sources={len(preview.missing_sources)}")
+        print("DRY RUN: no changes made. Re-run with --apply to execute.")
+        return
+
+    try:
+        result = apply_mod.run_apply(
+            target=target,
+            db_path=db_path,
+            plan_path=plan_path,
+            snapshot_dir=snapshot_dir,
+            manifest_path=manifest_path,
+            include_review=include_review,
+        )
+    except apply_mod.ApplyInterruptedError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except apply_mod.OrganizeApplyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print()
+    print("=== ORGANIZE APPLY ===")
+    for move in result.moved:
+        print(
+            f"{move.file_id} "
+            f"{_relative_to_root(move.src, result.target_root)} -> "
+            f"{_relative_to_root(move.dst, result.target_root)}"
+        )
+    print(f"moved={len(result.moved)}")
+    print(f"skipped_review={len(result.skipped_review)}")
+    print(f"skipped_identical={len(result.skipped_identical)}")
+    print(f"manifest={result.manifest_path}")
+    print(f"before_snapshot={_display_path(result.before_snapshot)}")
+    print(f"after_snapshot={_display_path(result.after_snapshot)}")
+    print(
+        "To undo, run: python -m local_file_organizer organize-rollback "
+        f"--manifest {result.manifest_path} --apply"
+    )
+
+
+def run_organize_rollback(
+    manifest_path: Path,
+    apply: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
+) -> None:
+    """Undo an apply from its rollback manifest (dry-run unless ``apply``).
+
+    Without ``apply`` this only prints the moves a rollback would perform.
+    With ``apply`` every recorded location is checksum-verified first; any
+    mismatch refuses the whole rollback without moving anything.
+    """
+    from . import organize_apply as apply_mod
+
+    if not apply:
+        try:
+            preview = apply_mod.plan_rollback_dry_run(manifest_path)
+        except apply_mod.OrganizeApplyError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        print()
+        print("=== ORGANIZE ROLLBACK (DRY RUN) ===")
+        for move in preview.moves:
+            print(f"{move.file_id} {move.src} -> {move.dst}")
+        print(f"would_restore={len(preview.moves)}")
+        print("DRY RUN: no changes made. Re-run with --apply to execute.")
+        return
+
+    try:
+        result = apply_mod.run_rollback(
+            manifest_path=manifest_path,
+            snapshot_dir=snapshot_dir,
+        )
+    except apply_mod.OrganizeApplyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    print()
+    print("=== ORGANIZE ROLLBACK ===")
+    for move in result.restored:
+        print(f"{move.file_id} {move.src} -> {move.dst}")
+    print(f"restored={len(result.restored)}")
+    print(f"before_snapshot={_display_path(result.before_snapshot)}")
+    print(f"after_snapshot={_display_path(result.after_snapshot)}")
+
+
 def run_face_review(
     target: Path,
     db_path: Path = DEFAULT_DB_PATH,
@@ -1653,6 +1788,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip writing the static offline plan viewer.",
     )
 
+    apply_parser = subparsers.add_parser(
+        "organize-apply",
+        help="Move files per the organization plan (dry-run by default).",
+    )
+    apply_parser.add_argument("target", type=Path, help="Target root to organize.")
+    apply_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    apply_parser.add_argument("--plan-path", type=Path, default=DEFAULT_PLAN_PATH)
+    apply_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the moves. Without it, only print what would happen.",
+    )
+    apply_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Alias for --apply (explicit confirmation for the real run).",
+    )
+    apply_parser.add_argument(
+        "--include-review",
+        action="store_true",
+        help="Also move entries with bucket review/unsupported (skipped by default).",
+    )
+    apply_parser.add_argument(
+        "--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR
+    )
+    apply_parser.add_argument(
+        "--manifest-path",
+        type=Path,
+        default=None,
+        help="Rollback manifest output path (default: <plan-dir>/apply_manifest_<ts>.json).",
+    )
+
+    rollback_parser = subparsers.add_parser(
+        "organize-rollback",
+        help="Undo an organize-apply from its rollback manifest.",
+    )
+    rollback_parser.add_argument(
+        "--manifest", type=Path, required=True, help="Rollback manifest to restore."
+    )
+    rollback_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Execute the rollback. Without it, only print what would happen.",
+    )
+    rollback_parser.add_argument(
+        "--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR
+    )
+
     review_parser = subparsers.add_parser(
         "face-review",
         help="Revisión visual local de clusters de personas (todo offline).",
@@ -1913,6 +2096,22 @@ def main(argv: Optional[list[str]] = None) -> None:
             quiet=args.quiet,
             view_dir=args.view_dir,
             write_view=not args.no_view,
+        )
+    elif args.command == "organize-apply":
+        run_organize_apply(
+            target=args.target,
+            db_path=args.db,
+            plan_path=args.plan_path,
+            apply=args.apply or args.yes,
+            include_review=args.include_review,
+            snapshot_dir=args.snapshot_dir,
+            manifest_path=args.manifest_path,
+        )
+    elif args.command == "organize-rollback":
+        run_organize_rollback(
+            manifest_path=args.manifest,
+            apply=args.apply,
+            snapshot_dir=args.snapshot_dir,
         )
     elif args.command == "face-review":
         run_face_review(
