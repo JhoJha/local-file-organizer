@@ -1154,6 +1154,37 @@ def run_organize_preview(
         print(f"View: {_display_path(result.view_path)}")
 
 
+def run_preview_serve(
+    target: Path,
+    db_path: Path = DEFAULT_DB_PATH,
+    plan_path: Path = DEFAULT_PLAN_PATH,
+    view_dir: Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8123,
+) -> None:
+    """Serve the plan viewer plus originals by opaque id (local only).
+
+    Read-only HTTP server bound strictly to 127.0.0.1: any other bind host
+    is refused, only GET/HEAD are served, and every file byte must resolve
+    inside the explicit target root (anything outside 404s without
+    disclosure). Blocks until interrupted; never writes or mutates.
+    """
+    from . import preview_serve as serve_mod
+
+    try:
+        serve_mod.run_preview_server(
+            target=target,
+            db_path=db_path,
+            plan_path=plan_path,
+            view_dir=view_dir,
+            host=host,
+            port=port,
+        )
+    except serve_mod.PreviewServeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _relative_to_root(path: Path, root: Path) -> str:
     """Render an in-target path relative to the target root for reports."""
     try:
@@ -1836,6 +1867,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR
     )
 
+    serve_parser = subparsers.add_parser(
+        "preview-serve",
+        help="Serve the plan viewer plus originals by opaque id (local only).",
+    )
+    serve_parser.add_argument("target", type=Path, help="Target root served files must stay inside.")
+    serve_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    serve_parser.add_argument("--plan-path", type=Path, default=DEFAULT_PLAN_PATH)
+    serve_parser.add_argument("--view-dir", type=Path, default=None)
+    serve_parser.add_argument("--host", type=str, default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8123)
+
     review_parser = subparsers.add_parser(
         "face-review",
         help="Revisión visual local de clusters de personas (todo offline).",
@@ -2112,6 +2154,15 @@ def main(argv: Optional[list[str]] = None) -> None:
             manifest_path=args.manifest,
             apply=args.apply,
             snapshot_dir=args.snapshot_dir,
+        )
+    elif args.command == "preview-serve":
+        run_preview_serve(
+            target=args.target,
+            db_path=args.db,
+            plan_path=args.plan_path,
+            view_dir=args.view_dir,
+            host=args.host,
+            port=args.port,
         )
     elif args.command == "face-review":
         run_face_review(
