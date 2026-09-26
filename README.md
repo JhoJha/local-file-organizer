@@ -114,7 +114,10 @@ python -m local_file_organizer face-review-import review_decisions.json
 python -m local_file_organizer organize-preview
 python -m local_file_organizer persons
 python -m local_file_organizer person-merge P0001 P0002 --name María
+python -m local_file_organizer tag /ruta/foto.jpg beach
+python -m local_file_organizer tags
 python -m local_file_organizer search --category video --person PERSON_0001 --min-duration 600
+python -m local_file_organizer search --tag beach --tag family
 ```
 
 Opciones de `scan`:
@@ -607,11 +610,13 @@ python -m local_file_organizer search --has-gps --bbox "35,45,-10,5" --sort size
 
 Filtros: `--category`/`--extension` (coma = OR), `--person` (repetible,
 todas deben aparecer; `P000N` = cluster crudo, `PERSON_0007`/nombre =
-identidad efectiva), `--device` (marca o modelo exacto),
+identidad efectiva), `--tag` (repetible, todas deben aparecer; nombre
+exacto, sensible a mayúsculas), `--device` (marca o modelo exacto),
 `--year`, `--min/max-duration`, `--min/max-size` (`500MB`, `1.5G`),
 `--has-gps`/`--has-device`/`--has-date`, `--bbox`, `--duplicates`,
 `--similar`. Todo flag acota (AND); valores siempre parametrizados
-(una inyección solo devuelve 0 filas).
+(una inyección solo devuelve 0 filas). Ver [User tags
+(T2)](#user-tags-t2) para crear y listar tags.
 
 La salida usa los mismos IDs `F000NNN` que `organization_plan.json`
 (numerados por `path` sobre todo el catálogo) e IDs nunca rutas:
@@ -621,6 +626,30 @@ para reutilizarse tal cual en colecciones inteligentes (V3.3) y reglas
 (V3.4). Índices sobre los campos de filtro se crean solos al abrir el
 catálogo. Sin full-text todavía: necesita extracción de texto
 documental (Tika/OCR), pendiente explícito.
+
+## User tags (T2)
+
+Tags are short user labels attached to catalog files. They live only
+in the local catalog (`tags` / `file_tag_links` tables, created
+automatically in older catalogs on open) and are never copied into
+`reports/organization_plan.json` or its static viewer.
+
+```bash
+python -m local_file_organizer tag /ruta/foto.jpg beach
+python -m local_file_organizer tag F000123 beach
+python -m local_file_organizer untag /ruta/foto.jpg beach
+python -m local_file_organizer tags
+python -m local_file_organizer search --tag beach --tag family
+```
+
+Rules: `tag` accepts a catalog path or a stable file id (`F000NNN`)
+and creates the tag on first use (re-attaching is a no-op); `untag`
+removes the link but keeps the tag itself; `tags` lists every tag
+with its active-file count (stale files excluded, consistent with
+`search`); `search --tag` is repeatable and every tag must match
+(AND, same as `--person`). Tag names are case-sensitive, up to 64
+characters, with no commas or control characters. An unknown tag in
+`search` simply matches zero rows.
 
 ## Scan incremental (F1)
 

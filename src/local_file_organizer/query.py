@@ -7,12 +7,14 @@ persisted by smart collections (V3.3) and evaluated by the rule engine
     {"version": 1, "and": [
         {"field": "category", "op": "=", "value": "video"},
         {"field": "person", "op": "=", "value": "PERSON_0001"},
+        {"field": "tag", "op": "=", "value": "beach"},
         {"field": "duration_seconds", "op": ">", "value": 600},
     ]}
 
-Every flag narrows (AND). Repeating a filter (e.g. two ``person``
-conditions) means the file must satisfy ALL of them — that is also how
-co-occurrence queries ("files showing A and B") are expressed.
+Every flag narrows (AND). Repeating a filter (e.g. two ``person`` or
+two ``tag`` conditions) means the file must satisfy ALL of them — that
+is also how co-occurrence queries ("files showing A and B") are
+expressed.
 
 Safety rules:
 
@@ -59,6 +61,7 @@ _FIELD_COLUMNS = {
 _SIMPLE_OPS = {"=", "!=", ">", ">=", "<", "<=", "like"}
 _SPECIAL_FIELDS = {
     "person",
+    "tag",  # user tag from file_tag_links, exact (case-sensitive) match
     "device",  # make OR model, case-insensitive exact
     "has_gps",
     "has_device",
@@ -234,6 +237,19 @@ def _condition_sql(conn: sqlite3.Connection, cond: dict) -> tuple[str, list]:
             "WHERE e.file_path = f.path AND e.person_id = ?)",
             [person_id],
         )
+    if field == "tag":
+        # User tags are matched exactly (case-sensitive) as stored.
+        # An unknown tag simply matches zero rows, never an error, so
+        # searching a tag that was never created is a valid empty result.
+        if op != "=" or not isinstance(value, str) or not value.strip():
+            raise ValueError("tag requires op '=' and a non-empty name")
+        if not _table_exists(conn, "file_tag_links"):
+            return "0 = 1", []
+        return (
+            "EXISTS (SELECT 1 FROM file_tag_links t "
+            "WHERE t.file_path = f.path AND t.tag_name = ?)",
+            [value.strip()],
+        )
     if field == "device":
         if op != "=" or not isinstance(value, str) or not value:
             raise ValueError("device requiere op '=' y texto no vacío")
@@ -357,6 +373,7 @@ def cli_filters(
     category: str | None = None,
     extension: str | None = None,
     persons: list[str] | None = None,
+    tags: list[str] | None = None,
     device: str | None = None,
     year: str | None = None,
     min_duration: float | None = None,
@@ -392,6 +409,8 @@ def cli_filters(
     _multi(extension, "extension", lower=True)
     for ref in persons or []:
         conditions.append({"field": "person", "op": "=", "value": ref})
+    for tag in tags or []:
+        conditions.append({"field": "tag", "op": "=", "value": tag})
     if device:
         conditions.append({"field": "device", "op": "=", "value": device})
     if year:

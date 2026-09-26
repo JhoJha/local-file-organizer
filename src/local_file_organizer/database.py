@@ -119,6 +119,17 @@ CREATE TABLE IF NOT EXISTS file_person_links (
     PRIMARY KEY (file_path, person_id)
 );
 CREATE INDEX IF NOT EXISTS idx_file_person_links_person ON file_person_links(person_id);
+CREATE TABLE IF NOT EXISTS tags (
+    tag_name TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_tag_links (
+    file_path TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (file_path, tag_name)
+);
+CREATE INDEX IF NOT EXISTS idx_file_tag_links_tag ON file_tag_links(tag_name);
 """
 
 # Columns added after the initial V1 schema. On an existing database that
@@ -945,6 +956,76 @@ def fetch_file_links(conn: sqlite3.Connection) -> list:
         "SELECT * FROM file_person_links ORDER BY file_path, person_id"
     )
     return cur.fetchall()
+
+
+# --- T2 user tags ------------------------------------------------------
+# Plain user labels attached to catalog files. Tags live only in the
+# local catalog (data/catalog.sqlite); the organization plan and its
+# static viewer never read these tables, so tags can't leak there.
+
+def upsert_tag(
+    conn: sqlite3.Connection, tag_name: str, created_at: str
+) -> None:
+    """Create a tag row, or keep the existing one untouched."""
+    conn.execute(
+        "INSERT INTO tags (tag_name, created_at) VALUES (?, ?) "
+        "ON CONFLICT(tag_name) DO NOTHING",
+        (tag_name, created_at),
+    )
+
+
+def fetch_tags(conn: sqlite3.Connection) -> list:
+    cur = conn.execute("SELECT * FROM tags ORDER BY tag_name")
+    return cur.fetchall()
+
+
+def fetch_tag(conn: sqlite3.Connection, tag_name: str):
+    cur = conn.execute("SELECT * FROM tags WHERE tag_name = ?", (tag_name,))
+    return cur.fetchone()
+
+
+def add_file_tag(
+    conn: sqlite3.Connection, file_path: str, tag_name: str, created_at: str
+) -> None:
+    """Attach a tag to a file (idempotent: re-attaching is a no-op)."""
+    conn.execute(
+        "INSERT INTO file_tag_links (file_path, tag_name, created_at) "
+        "VALUES (?, ?, ?) ON CONFLICT(file_path, tag_name) DO NOTHING",
+        (file_path, tag_name, created_at),
+    )
+
+
+def remove_file_tag(conn: sqlite3.Connection, file_path: str, tag_name: str) -> int:
+    """Detach a tag from a file. Returns the number of rows removed."""
+    cur = conn.execute(
+        "DELETE FROM file_tag_links WHERE file_path = ? AND tag_name = ?",
+        (file_path, tag_name),
+    )
+    return cur.rowcount
+
+
+def fetch_file_tag_links(conn: sqlite3.Connection) -> list:
+    try:
+        cur = conn.execute(
+            "SELECT * FROM file_tag_links ORDER BY file_path, tag_name"
+        )
+    except sqlite3.OperationalError:
+        return []
+    return cur.fetchall()
+
+
+def fetch_tags_for_file(conn: sqlite3.Connection, file_path: str) -> list[str]:
+    """Tag names attached to one file, ordered. Empty when the table
+    is missing (hand-made legacy DB) or the file has no tags."""
+    try:
+        rows = conn.execute(
+            "SELECT tag_name FROM file_tag_links WHERE file_path = ? "
+            "ORDER BY tag_name",
+            (file_path,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [row["tag_name"] for row in rows]
 
 
 # --- F1 incremental scan -------------------------------------------------

@@ -20,6 +20,7 @@ import cv2
 
 from . import database
 from . import person_identity
+from . import user_tags
 from .classifier import classify
 from .face_clustering import assign_person_labels, cluster_people
 from .face_clustering import (
@@ -976,6 +977,69 @@ def run_person_split(
     print(f"split -> {person_id} files={len(file_paths)}")
 
 
+def _run_tag_mutation(db_path: Path, action) -> tuple[str, str]:
+    """Open the catalog, apply a tag ``action(conn) -> (path, tag)``
+    atomically, and return the resulting pair."""
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    _require_catalog(conn, db_path)
+    try:
+        result = action(conn)
+    except ValueError as exc:
+        conn.close()
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    conn.commit()
+    conn.close()
+    return result
+
+
+def run_tag(
+    file_ref: str,
+    tag_name: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    path, tag = _run_tag_mutation(
+        db_path, lambda conn: user_tags.attach_tag(conn, file_ref, tag_name)
+    )
+    print(f"tagged {path} -> {tag}")
+
+
+def run_untag(
+    file_ref: str,
+    tag_name: str,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    path, tag = _run_tag_mutation(
+        db_path, lambda conn: user_tags.detach_tag(conn, file_ref, tag_name)
+    )
+    print(f"untagged {path} -/-> {tag}")
+
+
+def run_tags(db_path: Path = DEFAULT_DB_PATH) -> None:
+    """List user tags with their active-file counts (stale files excluded)."""
+    if not db_path.exists():
+        print(
+            f"ERROR: no existe el catálogo {db_path}. Ejecuta 'scan' primero.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    conn = database.connect(db_path)
+    _require_catalog(conn, db_path)
+    summary = user_tags.tag_summary(conn)
+    conn.close()
+    print()
+    print("=== TAGS ===")
+    for entry in summary:
+        print(f"{entry['tag_name']} files={entry['files']}")
+    print(f"tags={len(summary)}")
+
+
 def run_search(
     db_path: Path = DEFAULT_DB_PATH,
     show_files: bool = False,
@@ -1013,18 +1077,20 @@ def run_search(
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
     persons_by_path = resolve_file_persons(conn)
+    tags_by_path = user_tags.resolve_file_tags(conn)
     conn.close()
 
     print()
     print("=== SEARCH ===")
     for row in rows:
         persons = ",".join(sorted(persons_by_path.get(row["path"], ()))) or "-"
+        tags = ",".join(sorted(tags_by_path.get(row["path"], ()))) or "-"
         line = (
             f"{row['file_id']} category={row['category']} "
             f"size={human_readable_size(row['size_bytes'] or 0)} "
             f"capture={row['capture_date'] or '-'} "
             f"device={row['device_model'] or row['device_make'] or '-'} "
-            f"persons={persons}"
+            f"persons={persons} tags={tags}"
         )
         if show_files:
             line += f" path={row['path']}"
@@ -1673,6 +1739,36 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     split_parser.add_argument("--name", default=None, help="Nombre para mostrar.")
 
+    tag_parser = subparsers.add_parser(
+        "tag",
+        help="Attach a tag to a catalog file (creates the tag on first use).",
+    )
+    tag_parser.add_argument(
+        "file_ref", help="Catalog path or stable file id (F000NNN)."
+    )
+    tag_parser.add_argument(
+        "tag_name", help="Tag name (case-sensitive, max 64 chars, no commas)."
+    )
+    tag_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    untag_parser = subparsers.add_parser(
+        "untag",
+        help="Detach a tag from a catalog file (the tag itself is kept).",
+    )
+    untag_parser.add_argument(
+        "file_ref", help="Catalog path or stable file id (F000NNN)."
+    )
+    untag_parser.add_argument(
+        "tag_name", help="Tag name (case-sensitive, max 64 chars, no commas)."
+    )
+    untag_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
+    tags_parser = subparsers.add_parser(
+        "tags",
+        help="List user tags with their active-file counts.",
+    )
+    tags_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+
     search_parser = subparsers.add_parser(
         "search",
         help="Buscar en el catálogo por filtros estructurados (V3.2).",
@@ -1689,6 +1785,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="P000N, PERSON_0007 o nombre; repetible (todas deben aparecer).",
+    )
+    search_parser.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        dest="tag",
+        help="Tag name; repeatable (files must carry all of them).",
     )
     search_parser.add_argument(
         "--device", default=None, help="Fabricante o modelo exacto (ej. POCO X6)."
@@ -1847,6 +1950,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             db_path=args.db,
             name=args.name,
         )
+    elif args.command == "tag":
+        run_tag(file_ref=args.file_ref, tag_name=args.tag_name, db_path=args.db)
+    elif args.command == "untag":
+        run_untag(file_ref=args.file_ref, tag_name=args.tag_name, db_path=args.db)
+    elif args.command == "tags":
+        run_tags(db_path=args.db)
     elif args.command == "search":
         run_search(
             db_path=args.db,
@@ -1857,6 +1966,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             category=args.category,
             extension=args.extension,
             persons=args.person,
+            tags=args.tag,
             device=args.device,
             year=args.year,
             min_duration=args.min_duration,
