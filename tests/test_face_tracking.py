@@ -33,6 +33,8 @@ def _face(
     bbox=(10, 5, 30, 30),
     embedding=None,
     confidence: float = 0.9,
+    face_size_px: float = 0.0,
+    sharpness: float = 0.0,
 ) -> FrameFace:
     if embedding is None:
         embedding = _unit_on_circle(0.0)
@@ -41,6 +43,8 @@ def _face(
         bbox=bbox,
         embedding=np.asarray(embedding, dtype=np.float32),
         confidence=confidence,
+        face_size_px=face_size_px,
+        sharpness=sharpness,
     )
 
 
@@ -103,18 +107,68 @@ class TrackletLinkingTests(unittest.TestCase):
         self.assertTrue(all(len(t.members) == 2 for t in tracklets))
 
     def test_representative_embedding_is_mean(self):
+        # T1 update justification: the tracklet mean is now L2-normalized
+        # (face-quality T1 hygiene — representatives live on the same unit
+        # hypersphere as the normalized per-frame embeddings). Cosine
+        # distance is scale-invariant, so no clustering ranking changes;
+        # only the magnitude convention changed, hence this expectation.
         emb_a = _unit_on_circle(0.0)
         emb_b = _unit_on_circle(math.radians(10))
         tracklets = build_tracklets([_face(1000.0, embedding=emb_a), _face(2000.0, embedding=emb_b)])
         self.assertEqual(len(tracklets), 1)
-        expected = ((emb_a.astype(np.float64) + emb_b.astype(np.float64)) / 2).astype(np.float32)
+        mean = (emb_a.astype(np.float64) + emb_b.astype(np.float64)) / 2
+        expected = (mean / np.linalg.norm(mean)).astype(np.float32)
         np.testing.assert_allclose(tracklets[0].representative_embedding(), expected, rtol=1e-5)
+
+    def test_representative_embedding_is_unit_norm(self):
+        faces = [_face(1000.0 * (i + 1)) for i in range(3)]
+        rep = build_tracklets(faces)[0].representative_embedding()
+        self.assertAlmostEqual(float(np.linalg.norm(rep)), 1.0, places=5)
 
     def test_representative_member_is_highest_confidence(self):
         faces = [_face(1000.0, confidence=0.7), _face(2000.0, confidence=0.95)]
         rep = build_tracklets(faces)[0].representative_member()
         self.assertEqual(rep.timestamp_ms, 2000.0)
         self.assertAlmostEqual(rep.confidence, 0.95)
+
+    def test_quality_defaults_fall_back_to_confidence(self):
+        # Fixtures without gate info keep the old behavior: quality == confidence.
+        member = _face(1000.0, confidence=0.7)
+        self.assertAlmostEqual(member.quality, 0.7)
+
+    def test_representative_member_prefers_quality_over_raw_confidence(self):
+        # quality = conf*size*sharpness: a larger+sharper frame wins even
+        # with lower raw detector confidence (0.80*900*50 vs 0.95*900*5).
+        low_conf = _face(
+            1000.0, confidence=0.80, face_size_px=900.0, sharpness=50.0
+        )
+        high_conf = _face(
+            2000.0, confidence=0.95, face_size_px=900.0, sharpness=5.0
+        )
+        rep = build_tracklets([high_conf, low_conf])[0].representative_member()
+        self.assertEqual(rep.timestamp_ms, 1000.0)
+
+    def test_representative_member_tie_break_is_deterministic(self):
+        # Identical quality scores -> earliest timestamp, then bbox order,
+        # regardless of input order.
+        late = _face(
+            2000.0,
+            bbox=(20, 5, 30, 30),
+            confidence=0.9,
+            face_size_px=100.0,
+            sharpness=10.0,
+        )
+        early = _face(
+            1000.0,
+            bbox=(10, 5, 30, 30),
+            confidence=0.9,
+            face_size_px=100.0,
+            sharpness=10.0,
+        )
+        for ordering in ([late, early], [early, late]):
+            rep = build_tracklets(ordering)[0].representative_member()
+            self.assertEqual(rep.timestamp_ms, 1000.0)
+            self.assertEqual(rep.bbox, (10, 5, 30, 30))
 
 
 class TrackletDeterminismTests(unittest.TestCase):

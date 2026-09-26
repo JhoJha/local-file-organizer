@@ -955,6 +955,31 @@ class ClusterPeopleCliTests(unittest.TestCase):
         self.assertIn("rejected_faces=2", printed)
         self.assertIn("person_clusters=1", printed)
 
+    def test_blur_gate_rejects_flat_roi_before_embedding(self):
+        from unittest import mock
+
+        from local_file_organizer import cli as cli_module
+
+        flat = self.target / "flat.png"
+        Image.new("RGB", (64, 64), color=(200, 50, 50)).save(flat, format="PNG")
+
+        def _fake_detect(path, **kwargs):
+            return (64, 64, self._rows_array([self._row(10)]), None)
+
+        compute = mock.Mock(return_value=self._emb(0))
+        with (
+            mock.patch.object(cli_module, "detect_faces_raw", side_effect=_fake_detect),
+            mock.patch.object(cli_module, "compute_embedding", compute),
+        ):
+            printed = self._run()
+
+        # The 30x30 box over a solid-color ROI scores ~0 sharpness, below
+        # the blur floor: rejected by the gate, embedding never computed.
+        self.assertIn("face_observations_considered=1", printed)
+        self.assertIn("usable_embeddings=0", printed)
+        self.assertIn("rejected_faces=1", printed)
+        compute.assert_not_called()
+
     def test_redact_paths_hides_paths_but_not_person_labels(self):
         from unittest import mock
 

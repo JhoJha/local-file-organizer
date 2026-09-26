@@ -479,6 +479,29 @@ distancia Hamming donde *menor* = más estricto; aquí es una similitud
 coseno donde *mayor* = más estricto. No asumir que ambas flags funcionan
 igual.
 
+### Higiene de embeddings y filtro de calidad (T1)
+
+Antes de agrupar, cada detección pasa el mismo filtro de calidad en
+`cluster-people` y `person-suggest` (imagen y video, un solo helper
+compartido para que ambos comandos no diverjan): se re-verifican la
+confianza (`row[14]`) y el tamaño (`row[2:4]`) de YuNet y se exige una
+nitidez mínima del recorte — varianza del Laplaciano sobre el ROI en
+grises, con `cv2` ya instalado, sin dependencias nuevas. El umbral
+(`DEFAULT_BLUR_THRESHOLD = 2.0` en `face_detection.py`) es un suelo
+conservador: solo descarta recortes casi planos (color sólido,
+artefactos de decodificación, varianza ~0); las caras reales nítidas
+puntúan órdenes de magnitud por encima. Los umbrales 0.50/0.40 no
+cambian.
+
+Cada embedding SFace se L2-normaliza a norma unidad al calcularlo
+(vectores de norma cero se descartan) y la media de cada tracklet de
+video también se normaliza, así que representantes y observaciones
+viven en la misma hiperesfera — la distancia coseno no cambia de
+orden, solo se estabiliza la magnitud. La evidencia guardada por
+tracklet es el mejor frame por calidad
+(`confianza × tamaño × nitidez`, con desempate determinista por
+`timestamp_ms` y bbox), no simplemente la mayor confianza.
+
 ### Etiquetas anónimas y qué se guarda
 
 Cada cluster recibe una etiqueta anónima `P0001`, `P0002`, … (asignación

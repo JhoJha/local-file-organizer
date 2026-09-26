@@ -43,6 +43,24 @@ def _make_png(path: Path, size=(80, 80), color=(120, 60, 30)) -> Path:
     return path
 
 
+def _make_textured_png(path: Path, size=(80, 80)) -> Path:
+    """Checkerboard PNG with high Laplacian variance.
+
+    T1 fixture note: tests that mock the detector with fake face rows
+    but read real pixels through the ingestion quality gate need
+    textured pixels — flat `_make_png` images score ~0 sharpness and
+    are (correctly) rejected by the blur gate, so they yield zero
+    observations here.
+    """
+    import cv2
+    import numpy as np
+
+    board = (np.indices((size[1], size[0])).sum(axis=0) % 2 * 255).astype(np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(board, cv2.COLOR_GRAY2BGR))
+    return path
+
+
 def _make_video_bytes(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"fake-video-bytes")
@@ -783,8 +801,8 @@ class ClusterPeopleObservationTests(FaceReviewTestBase):
         from local_file_organizer import cli as cli_module
         from local_file_organizer.cli import run_cluster_people
 
-        _make_png(self.target / "a.png", size=(64, 64))
-        _make_png(self.target / "b.png", size=(64, 64))
+        _make_textured_png(self.target / "a.png", size=(64, 64))
+        _make_textured_png(self.target / "b.png", size=(64, 64))
         rows_by_name = {
             "a.png": np.array([self._row(10)], dtype=np.float32),
             "b.png": np.array([self._row(50)], dtype=np.float32),
@@ -853,7 +871,7 @@ class ClusterPeopleObservationTests(FaceReviewTestBase):
             with tempfile.TemporaryDirectory() as tmp:
                 for index, timestamp in enumerate(timestamps):
                     frame = Path(tmp) / f"frame_{index:04d}.png"
-                    _make_png(frame, size=(160, 120))
+                    _make_textured_png(frame, size=(160, 120))
                     if on_frame is not None:
                         on_frame(frame, timestamp, index)
             return SamplingResult(

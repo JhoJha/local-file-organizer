@@ -37,6 +37,7 @@ from .face_detection import (
     DEFAULT_MIN_FACE_SIZE_PX,
     detect_faces_in_image_file,
     detect_faces_raw,
+    passes_quality_gate,
 )
 from .exiftool import exiftool_available, get_exif_metadata
 from .face_embedding import compute_embedding
@@ -669,17 +670,24 @@ def run_cluster_people(
             img = cv2.imread(str(file_path))
             for row in rows:
                 face_observations_considered += 1
-                w = round(float(row[2]))
-                h = round(float(row[3]))
-                if w < min_face_size or h < min_face_size:
-                    continue
-                if img is None:
+                # Shared quality gate (conf re-check + size + blur over
+                # the already-loaded ROI): one bar for all 4 ingestion
+                # sites, so cluster and suggest cannot drift apart.
+                ok, _face_size, _sharpness = passes_quality_gate(
+                    img,
+                    row,
+                    min_face_size_px=min_face_size,
+                    confidence_threshold=confidence_threshold,
+                )
+                if not ok:
                     continue
                 emb = compute_embedding(img, row)
                 if emb is None:
                     continue
                 x = max(0, round(float(row[0])))
                 y = max(0, round(float(row[1])))
+                w = round(float(row[2]))
+                h = round(float(row[3]))
                 observations.append(
                     ClusterableObservation(
                         key=(str(file_path), "image", -1, x),
@@ -728,21 +736,29 @@ def run_cluster_people(
                     timestamp_ms2 = timestamp * 1000
                     for frow2 in frows2:
                         face_counts["considered"] += 1
-                        w2 = round(float(frow2[2]))
-                        h2 = round(float(frow2[3]))
-                        if w2 < min_face_size or h2 < min_face_size:
+                        ok2, size2, sharp2 = passes_quality_gate(
+                            frame_img2,
+                            frow2,
+                            min_face_size_px=min_face_size,
+                            confidence_threshold=confidence_threshold,
+                        )
+                        if not ok2:
                             continue
                         emb2 = compute_embedding(frame_img2, frow2)
                         if emb2 is None:
                             continue
                         x2 = max(0, round(float(frow2[0])))
                         y2 = max(0, round(float(frow2[1])))
+                        w2 = round(float(frow2[2]))
+                        h2 = round(float(frow2[3]))
                         frame_detections.append(
                             FrameFace(
                                 timestamp_ms=timestamp_ms2,
                                 bbox=(x2, y2, w2, h2),
                                 embedding=emb2,
                                 confidence=float(frow2[14]),
+                                face_size_px=size2,
+                                sharpness=sharp2,
                             )
                         )
 
@@ -937,8 +953,15 @@ def run_person_suggest(
                 continue
             img = cv2.imread(str(file_path))
             for row in rows:
-                w, h = round(float(row[2])), round(float(row[3]))
-                if w < min_face_size or h < min_face_size or img is None:
+                # Same shared quality gate as run_cluster_people (site 3
+                # of 4): conf re-check + size + blur over the loaded ROI.
+                ok, _face_size, _sharpness = passes_quality_gate(
+                    img,
+                    row,
+                    min_face_size_px=min_face_size,
+                    confidence_threshold=confidence_threshold,
+                )
+                if not ok:
                     continue
                 emb = compute_embedding(img, row)
                 if emb is None:
@@ -970,18 +993,27 @@ def run_person_suggest(
                     if frame_img is None:
                         return
                     for frow in frows:
-                        w, h = round(float(frow[2])), round(float(frow[3]))
-                        if w < min_face_size or h < min_face_size:
+                        # Same shared quality gate (site 4 of 4).
+                        ok, size, sharp = passes_quality_gate(
+                            frame_img,
+                            frow,
+                            min_face_size_px=min_face_size,
+                            confidence_threshold=confidence_threshold,
+                        )
+                        if not ok:
                             continue
                         emb = compute_embedding(frame_img, frow)
                         if emb is None:
                             continue
+                        w, h = round(float(frow[2])), round(float(frow[3]))
                         frame_detections.append(
                             FrameFace(
                                 timestamp_ms=timestamp * 1000,
                                 bbox=(max(0, round(float(frow[0]))), round(float(frow[1])), w, h),
                                 embedding=emb,
                                 confidence=float(frow[14]),
+                                face_size_px=size,
+                                sharpness=sharp,
                             )
                         )
 

@@ -84,5 +84,47 @@ class EmbeddingFailureTests(unittest.TestCase):
         self.assertIsNone(compute_embedding(img, np.zeros((7,), dtype=np.float32)))
 
 
+class EmbeddingHygieneTests(unittest.TestCase):
+    """T1 hygiene: L2-normalized output, aligned/zero-norm guards."""
+
+    def test_output_is_unit_norm(self):
+        emb = compute_embedding(_synthetic_image(), _fake_row())
+        self.assertIsNotNone(emb)
+        assert emb is not None
+        self.assertAlmostEqual(float(np.linalg.norm(emb)), 1.0, places=5)
+
+    def _compute_with_fake(self, aligned, feature):
+        from unittest import mock
+
+        from local_file_organizer import face_embedding
+
+        class _FakeRecognizer:
+            def alignCrop(self, _img, _row):
+                return aligned
+
+            def feature(self, _aligned):
+                return feature
+
+        with mock.patch.object(
+            face_embedding, "get_face_recognizer", return_value=_FakeRecognizer()
+        ):
+            return compute_embedding(_synthetic_image(), _fake_row())
+
+    def test_zero_norm_feature_returns_none(self):
+        aligned = np.zeros((112, 112, 3), dtype=np.uint8)
+        self.assertGreater(np.asarray(aligned).size, 0)
+        self.assertIsNone(
+            self._compute_with_fake(aligned, np.zeros(128, dtype=np.float32))
+        )
+
+    def test_empty_aligned_returns_none(self):
+        self.assertIsNone(
+            self._compute_with_fake(
+                np.zeros((0, 0, 3), dtype=np.uint8),
+                np.ones(128, dtype=np.float32),
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,7 +41,9 @@ def compute_embedding(
     `raw_face_row` is one row (15 floats) from
     `face_detection.detect_faces_raw`'s output — has the landmarks
     `alignCrop` needs. Returns a plain 1-D `(128,)` float32 numpy array,
-    or None on any failure. Pure in-memory transform: does not read or
+    L2-normalized to unit norm (so downstream cosine distances compare
+    directions only, immune to per-frame feature magnitude jitter), or
+    None on any failure. Pure in-memory transform: does not read or
     write any file. Never log or persist its return value beyond the
     caller's immediate use in the same run.
     """
@@ -53,11 +55,21 @@ def compute_embedding(
             return None
         recognizer = get_face_recognizer()
         aligned = recognizer.alignCrop(image_bgr, row)
+        if aligned is None:
+            return None
+        try:
+            if np.asarray(aligned).size == 0:
+                return None
+        except Exception:
+            return None
         feature = recognizer.feature(aligned)
         arr = np.asarray(feature, dtype=np.float32).reshape(-1)
         if arr.shape != (EMBEDDING_DIM,):
             return None
-        return arr
+        norm = float(np.linalg.norm(arr))
+        if norm == 0.0 or not np.isfinite(norm):
+            return None
+        return (arr / norm).astype(np.float32)
     except Exception:
         return None
 

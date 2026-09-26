@@ -24,6 +24,7 @@ anything. CPU only, no new dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 
@@ -51,6 +52,27 @@ class FrameFace:
     bbox: tuple[int, int, int, int]  # (x, y, width, height)
     embedding: np.ndarray  # (128,) float32, never persisted
     confidence: float
+    # Quality fields, populated by the ingestion quality gate
+    # (face_detection.passes_quality_gate): box area (w*h) in px and
+    # Laplacian-variance sharpness of the ROI. They default to 0.0 so
+    # callers without quality info (older tests, synthetic fixtures)
+    # keep working: `quality` then falls back to plain confidence.
+    face_size_px: float = 0.0
+    sharpness: float = 0.0
+    # Best-frame score: confidence*size*sharpness when quality info is
+    # present, else confidence. None means "derive in __post_init__".
+    quality: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.quality is None:
+            if self.face_size_px > 0.0 and self.sharpness > 0.0:
+                self.quality = (
+                    float(self.confidence)
+                    * float(self.face_size_px)
+                    * float(self.sharpness)
+                )
+            else:
+                self.quality = float(self.confidence)
 
 
 @dataclass
@@ -60,26 +82,43 @@ class Tracklet:
     members: list[FrameFace] = field(default_factory=list)
 
     def representative_embedding(self) -> np.ndarray:
-        """Mean embedding of the members (float32).
+        """L2-normalized mean embedding of the members (float32).
 
-        Averaging same-face observations denoises per-frame jitter;
-        cosine distance is scale-invariant so no renormalization is
-        needed for the downstream clustering.
+        Averaging same-face observations denoises per-frame jitter; the
+        mean is then L2-normalized to unit norm so the tracklet
+        representative lives on the same hypersphere as the (also
+        normalized) per-frame embeddings — cosine distance is
+        scale-invariant, so this changes no ranking, it only keeps
+        magnitudes comparable for the downstream clustering. A
+        zero-norm mean (degenerate all-zero members) cannot be
+        normalized and is returned as-is.
         """
         stacked = np.stack(
             [np.asarray(m.embedding, dtype=np.float64) for m in self.members]
         )
-        return np.asarray(stacked.mean(axis=0), dtype=np.float32)
+        mean = stacked.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm == 0.0 or not np.isfinite(norm):
+            return np.asarray(mean, dtype=np.float32)
+        return np.asarray(mean / norm, dtype=np.float32)
 
     def representative_member(self) -> FrameFace:
-        """Highest-confidence member (ties: earliest frame, then bbox order).
+        """Best-quality member (ties: earliest frame, then bbox order).
 
-        Used for the persisted observation detail row (bbox, timestamp,
-        confidence shown in review), where the sharpest detection is the
-        most useful evidence.
+        Ranks by `quality` (confidence*size*sharpness when the
+        ingestion gate populated it, else plain confidence), so the
+        persisted observation detail row (bbox, timestamp, confidence
+        shown in review) carries the sharpest detection as evidence.
+        The (timestamp_ms, bbox) tie-break keeps the choice
+        deterministic for identical scores.
         """
         return min(
-            self.members, key=lambda m: (-m.confidence, m.timestamp_ms, m.bbox)
+            self.members,
+            key=lambda m: (
+                -(m.quality if m.quality is not None else m.confidence),
+                m.timestamp_ms,
+                m.bbox,
+            ),
         )
 
 

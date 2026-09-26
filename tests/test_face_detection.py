@@ -19,9 +19,12 @@ from PIL import Image
 
 from local_file_organizer import face_detection
 from local_file_organizer.face_detection import (
+    DEFAULT_BLUR_THRESHOLD,
     MODEL_PATH,
     MODEL_SHA256,
     detect_faces_in_image_file,
+    face_roi_sharpness,
+    passes_quality_gate,
 )
 
 
@@ -158,6 +161,93 @@ class ModelIntegrityTests(unittest.TestCase):
     def test_vendored_model_sha256(self):
         digest = hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest()
         self.assertEqual(digest, MODEL_SHA256)
+
+
+class QualityGateTests(unittest.TestCase):
+    """Shared ingestion gate: conf/size re-check + Laplacian blur gate."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = Path(self.tmpdir.name)
+
+    def _save_checkerboard(self, path: Path, size=64):
+        import cv2
+
+        board = (np.indices((size, size)).sum(axis=0) % 2 * 255).astype(np.uint8)
+        cv2.imwrite(str(path), cv2.cvtColor(board, cv2.COLOR_GRAY2BGR))
+
+    def _load(self, path: Path):
+        import cv2
+
+        img = cv2.imread(str(path))
+        self.assertIsNotNone(img)
+        return img
+
+    def test_textured_roi_passes_with_size_and_sharpness(self):
+        path = self.dir / "sharp.png"
+        self._save_checkerboard(path)
+        ok, size, sharp = passes_quality_gate(
+            self._load(path), np.array(_row(10, 5, 30, 30), dtype=np.float32)
+        )
+        self.assertTrue(ok)
+        self.assertEqual(size, 900.0)
+        self.assertGreaterEqual(sharp, DEFAULT_BLUR_THRESHOLD)
+
+    def test_flat_roi_rejected_by_blur_gate(self):
+        path = self.dir / "flat.png"
+        _save_solid(path)
+        img = self._load(path)
+        self.assertEqual(face_roi_sharpness(img, 10, 5, 30, 30), 0.0)
+        ok, size, sharp = passes_quality_gate(
+            img, np.array(_row(10, 5, 30, 30), dtype=np.float32)
+        )
+        self.assertEqual((ok, size, sharp), (False, 0.0, 0.0))
+
+    def test_zero_blur_threshold_keeps_flat_roi_boundary_inclusive(self):
+        # Inclusivity proof: sharpness 0.0 survives a 0.0 floor (>=).
+        path = self.dir / "flat.png"
+        _save_solid(path)
+        ok, _, _ = passes_quality_gate(
+            self._load(path),
+            np.array(_row(10, 5, 30, 30), dtype=np.float32),
+            blur_threshold=0.0,
+        )
+        self.assertTrue(ok)
+
+    def test_small_box_rejected(self):
+        path = self.dir / "sharp.png"
+        self._save_checkerboard(path)
+        ok, _, _ = passes_quality_gate(
+            self._load(path),
+            np.array(_row(10, 5, 5, 5), dtype=np.float32),
+            min_face_size_px=20,
+        )
+        self.assertFalse(ok)
+
+    def test_low_confidence_rejected(self):
+        path = self.dir / "sharp.png"
+        self._save_checkerboard(path)
+        ok, _, _ = passes_quality_gate(
+            self._load(path),
+            np.array(_row(10, 5, 30, 30, 0.5), dtype=np.float32),
+            confidence_threshold=0.6,
+        )
+        self.assertFalse(ok)
+
+    def test_malformed_row_and_none_image_rejected_not_raise(self):
+        path = self.dir / "sharp.png"
+        self._save_checkerboard(path)
+        img = self._load(path)
+        self.assertEqual(
+            passes_quality_gate(img, np.array([1, 2, 3], dtype=np.float32)),
+            (False, 0.0, 0.0),
+        )
+        self.assertEqual(
+            passes_quality_gate(None, np.array(_row(10, 5, 30, 30), dtype=np.float32)),
+            (False, 0.0, 0.0),
+        )
+        self.assertEqual(face_roi_sharpness(img, 200, 200, 30, 30), 0.0)
 
 
 if __name__ == "__main__":

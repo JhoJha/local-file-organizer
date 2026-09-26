@@ -23,6 +23,15 @@ DEFAULT_NMS_THRESHOLD = 0.3
 DEFAULT_TOP_K = 5000
 DEFAULT_MIN_FACE_SIZE_PX = 20
 
+# Minimum face-ROI sharpness (variance of the Laplacian over the
+# grayscale ROI) for a detection to survive the quality gate below.
+# Deliberately a conservative floor, not a deblurring bar: sharp real
+# faces score in the tens-to-hundreds, while solid-color or
+# decode-artifact boxes score ~0. The floor only rejects those
+# near-flat, uninformative ROIs; small or low-contrast but usable faces
+# still pass. Boundary is inclusive (>= survives).
+DEFAULT_BLUR_THRESHOLD = 2.0
+
 # Lazily-created detectors, keyed by (confidence, nms, top_k) so tests can
 # request fresh instances with different thresholds.
 _detector_cache: dict = {}
@@ -147,3 +156,77 @@ def detect_faces_in_image_file(
         )
     except Exception as exc:  # one bad file must never crash the batch
         return FaceDetectionResult(width=0, height=0, faces=[], error=str(exc))
+
+
+def face_roi_sharpness(
+    image_bgr: np.ndarray, x: int, y: int, w: int, h: int
+) -> float:
+    """Variance of the Laplacian over the grayscale face ROI, never raising.
+
+    Higher = sharper. Returns 0.0 when the ROI is empty, out of bounds,
+    or unmeasurable for any reason (which the quality gate rejects).
+    Pure in-memory measure over the already-loaded image: no file I/O.
+    """
+    try:
+        if (
+            not isinstance(image_bgr, np.ndarray)
+            or image_bgr.ndim != 3
+            or w <= 0
+            or h <= 0
+        ):
+            return 0.0
+        img_h, img_w = image_bgr.shape[0], image_bgr.shape[1]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(img_w, x + w), min(img_h, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        roi = image_bgr[y0:y1, x0:x1]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if not np.isfinite(sharpness) or sharpness < 0.0:
+            return 0.0
+        return sharpness
+    except Exception:
+        return 0.0
+
+
+def passes_quality_gate(
+    image_bgr: np.ndarray,
+    raw_face_row: np.ndarray,
+    *,
+    min_face_size_px: int = DEFAULT_MIN_FACE_SIZE_PX,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    blur_threshold: float = DEFAULT_BLUR_THRESHOLD,
+) -> tuple[bool, float, float]:
+    """Shared ingestion quality gate over one raw YuNet row, never raising.
+
+    Re-checks confidence (`row[14]`) and size (`row[2:4]`) explicitly —
+    `detect_faces_raw` rows are unfiltered, so every ingestion site
+    (cluster/suggest × image/video) must apply the same bar — then
+    applies the blur gate (`face_roi_sharpness` over the already-loaded
+    image). Returns `(ok, face_size_px, sharpness)` where `face_size_px`
+    is the `w*h` box area and `sharpness` the Laplacian variance; both
+    are 0.0 when the gate rejects. All comparisons are inclusive
+    (>= survives). A `None`/undecodable image never passes.
+    """
+    try:
+        row = np.asarray(raw_face_row, dtype=np.float32).reshape(-1)
+        if row.shape != (15,):
+            return (False, 0.0, 0.0)
+        if float(row[14]) < confidence_threshold:
+            return (False, 0.0, 0.0)
+        w = round(float(row[2]))
+        h = round(float(row[3]))
+        if w < min_face_size_px or h < min_face_size_px:
+            return (False, 0.0, 0.0)
+        if not isinstance(image_bgr, np.ndarray) or image_bgr.ndim != 3:
+            return (False, 0.0, 0.0)
+        x = max(0, round(float(row[0])))
+        y = max(0, round(float(row[1])))
+        face_size_px = float(w * h)
+        sharpness = face_roi_sharpness(image_bgr, x, y, w, h)
+        if sharpness < blur_threshold:
+            return (False, 0.0, 0.0)
+        return (True, face_size_px, sharpness)
+    except Exception:
+        return (False, 0.0, 0.0)
