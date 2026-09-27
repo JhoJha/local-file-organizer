@@ -26,3 +26,5 @@ __pycache__/
 *.egg-info/
 .ruff_cache/
 .venv/
+# Local Pi runtime state
+.atl/
