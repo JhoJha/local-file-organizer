@@ -2535,6 +2535,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Incluye rutas reales (solo ejecución manual).",
     )
 
+    organize_flow_parser = subparsers.add_parser(
+        "organize",
+        help=(
+            "Ejecuta el pipeline completo guiado: scan, sample-frames, "
+            "detect-faces, cluster-people, face-review (con pausa para "
+            "revisar), organize-preview y organize-apply (con confirmación)."
+        ),
+    )
+    organize_flow_parser.add_argument("target", type=Path, help="Ruta a organizar.")
+    organize_flow_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    organize_flow_parser.add_argument("--csv", type=Path, default=DEFAULT_CSV_PATH)
+    organize_flow_parser.add_argument("--plan-path", type=Path, default=DEFAULT_PLAN_PATH)
+    organize_flow_parser.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    organize_flow_parser.add_argument(
+        "--face-review-dir", type=Path, default=DEFAULT_FACE_REVIEW_DIR
+    )
+    organize_flow_parser.add_argument(
+        "--decisions", type=Path, default=DEFAULT_FACE_REVIEW_DECISIONS
+    )
+    organize_flow_parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="No pausar para revisar/curar los clusters de personas.",
+    )
+    organize_flow_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Detenerse tras organize-preview, sin aplicar nada.",
+    )
+    organize_flow_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirmar organize-apply sin preguntar (modo no interactivo).",
+    )
+    organize_flow_parser.add_argument("--quiet", action="store_true")
+
     return parser
 
 
@@ -2617,6 +2653,22 @@ def main(argv: Optional[list[str]] = None) -> None:
             include_review=args.include_review,
             snapshot_dir=args.snapshot_dir,
             manifest_path=args.manifest_path,
+        )
+    elif args.command == "organize":
+        from .guided_flow import run_guided_organize
+
+        run_guided_organize(
+            target=args.target,
+            db_path=args.db,
+            csv_path=args.csv,
+            plan_path=args.plan_path,
+            snapshot_dir=args.snapshot_dir,
+            face_review_dir=args.face_review_dir,
+            face_review_decisions=args.decisions,
+            review=not args.no_review,
+            dry_run=args.dry_run,
+            yes=args.yes,
+            quiet=args.quiet,
         )
     elif args.command == "organize-rollback":
         run_organize_rollback(

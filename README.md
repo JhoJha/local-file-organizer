@@ -108,6 +108,16 @@ instalarlo de forma aislada como herramienta de línea de comandos:
 pipx install .
 ```
 
+## Uso rápido
+
+Para organizar una carpeta de punta a punta sin memorizar los ~20
+subcomandos, usa el comando guiado `organize` (ver
+[Comando guiado `organize`](#comando-guiado-organize)):
+
+```bash
+lfo organize /ruta/a/analizar
+```
+
 ## Uso
 
 Desde la raíz del proyecto:
@@ -131,6 +141,7 @@ python -m local_file_organizer search --category video --person PERSON_0001 --mi
 python -m local_file_organizer search --tag beach --tag family
 python -m local_file_organizer organize-apply /ruta/a/organizar
 python -m local_file_organizer organize-rollback --manifest reports/apply_manifest_<ts>.json --apply
+python -m local_file_organizer organize /ruta/a/organizar
 ```
 
 Opciones de `scan`:
@@ -968,6 +979,37 @@ destination paths, and SHA-256 checksums. The command prints the exact
 `organize-rollback --manifest ... --apply` invocation to undo. Rollback
 checksum-verifies every location first and refuses the whole undo on any
 mismatch. Reports show paths relative to the target root.
+
+## Comando guiado `organize`
+
+`organize <target>` runs the full pipeline in order, calling the same
+functions each standalone subcommand already calls (no subprocesses, no
+new behavior added to any of them): `scan` -> `sample-frames` ->
+`detect-faces` -> `cluster-people` -> `face-review` -> `organize-preview`
+-> `organize-apply`. It prints numbered progress
+(`[3/7] Detectando rostros...`) and stops at two checkpoints:
+
+- After `face-review` it prints the path to the generated
+  `index.html` and pauses so you can open it, curate cluster decisions,
+  and press Enter to continue. Use `--no-review` to skip the pause (the
+  report is still generated).
+- After `organize-preview` it asks for explicit confirmation before
+  calling `organize-apply`. Use `--yes` to confirm non-interactively, or
+  `--dry-run` to stop after the preview and never apply.
+
+```bash
+lfo organize /path/to/root
+lfo organize /path/to/root --no-review --yes
+lfo organize /path/to/root --dry-run
+```
+
+Flags mirror the individual subcommands: `--db`, `--csv`, `--plan-path`,
+`--snapshot-dir`, `--face-review-dir`, `--decisions`, `--quiet`.
+
+Re-running `organize` on the same target resumes safely: `scan` is
+incremental by default and every later step upserts its own
+tables/files, so already-processed work is not redone from scratch.
+Existing subcommands are unchanged; `organize` only orchestrates them.
 
 ## Frontera de privacidad (futuro)
 
