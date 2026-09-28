@@ -27,7 +27,7 @@ Mode: off (no project config). Runner: `pytest`. Ordinary checks: `pytest -q`, `
 
 ## Tasks
 - [x] T1 — lfo entry point + README install. Route: delegated direct (bundled with T2 writer). Commit: 6f7b2e4.
-- [x] T2 — guided `organize` command + tests + README. Route: delegated direct (writer trigger: cli.py + new module + tests). Commit: pending (this commit).
+- [x] T2 — guided `organize` command + tests + README. Route: delegated direct (writer trigger: cli.py + new module + tests). Commit: 5dd1f12.
 
 ## Verification
 - `python -m pytest -q`: 436 passed.
