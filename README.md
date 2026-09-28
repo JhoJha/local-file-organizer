@@ -100,6 +100,14 @@ Instala las dependencias del proyecto (idealmente en un entorno virtual):
 pip install -e .
 ```
 
+Esto también instala el comando `lfo` (definido en `[project.scripts]` de
+`pyproject.toml`), equivalente a `python -m local_file_organizer`. Para
+instalarlo de forma aislada como herramienta de línea de comandos:
+
+```bash
+pipx install .
+```
+
 ## Uso
 
 Desde la raíz del proyecto:
