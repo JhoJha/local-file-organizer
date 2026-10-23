@@ -56,6 +56,7 @@ python -m local_file_organizer search --category image
 
 ## Qué no funciona / quedó pendiente
 
+- **Sin evidencia de uso sobre una biblioteca real.** Está probado con tests y carpetas de prueba, pero no conservo un catálogo generado sobre mis fotos. No puedo afirmar qué tan buenas son las agrupaciones de caras ni el plan de organización con datos reales.
 - **No organiza nada todavía:** `organize-apply` (mover archivos con dry-run y rollback) nunca se implementó. Solo existe la vista previa.
 - No hay OCR ni clasificación de documentos, ni búsqueda full-text.
 - EXIF usa un subproceso por archivo (~0.2–0.5 s). Con decenas de miles de archivos haría falta el modo batch de exiftool.
