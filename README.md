@@ -77,4 +77,6 @@ Python · SQLite · Pillow (dHash) · OpenCV (YuNet + SFace, ONNX) · ffmpeg/ffp
 
 ## Licencia
 
+© 2026 Jhon Villegas — código bajo [MIT](LICENSE).
+
 Los modelos en `models/` son de OpenCV Zoo y conservan su licencia (MIT y Apache-2.0); ver [`models/README.md`](models/README.md).
