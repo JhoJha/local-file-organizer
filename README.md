@@ -1,4 +1,4 @@
-# local-file-organizer (V2.5.1 — inventario read-only + similitud visual + muestreo de frames + detección facial + clustering anónimo + revisión de clusters + vista previa de organización con confianza)
+# local-file-organizer (V3.2 + F1 — catálogo local, rostros anónimos, búsqueda, vista previa y organización con rollback)
 
 Organizador inteligente de archivos personales, 100% local. El sistema
 **únicamente inventaría y analiza** una carpeta: no mueve, renombra, borra
@@ -1038,33 +1038,17 @@ Un futuro módulo tipo `ai_gateway` sería responsable de sanitizar el
 catálogo antes de enviarlo; no existe todavía ninguna abstracción de ese
 tipo en esta V1, y no debe añadirse hasta que sea necesaria.
 
-## Roadmap (no implementado todavía)
+## Estado y roadmap
 
-- V2.1 (implementado): hashing perceptual de imágenes y agrupación por
-  similitud visual.
-- V2.2 (implementado): muestreo efímero de frames de video (`sample-frames`,
-  tabla `video_frame_samples`); sin detección facial todavía.
-- V2.3 (implementado): detección facial local (`detect-faces`, tabla
-  `face_observations`); detecta regiones, no identifica personas.
-- V2.4 (implementado): embeddings faciales (SFace vendoreado, nunca
-  persistidos) y clustering anónimo de personas (`cluster-people`, tabla
-  `person_cluster_members`, etiquetas `P0001`, …); agrupa quién-aparece-
-  dónde sin identificar a nadie.
-- V2.4.1 (implementado): revisión visual local de clusters
-  (`face-review`/`face-review-import`, `reports/face_review/`, tabla
-  `person_cluster_observations`); anotaciones humanas (`confirmed`/
-  `rejected`/`uncertain`), sin auto-merge.
-- V2.5 (implementado): vista previa de organización read-only
-  (`organize-preview`, `reports/organization_plan.json`), pares/grupos de
-  coocurrencia (`PAIR_000N`/`GROUP_000N`).
-- V2.5.1 (implementado): routing por confianza `high`/`medium`/`low` en la
-  vista previa; singletons y evidencia débil a `Revisión/`
-  (`Baja_evidencia/`, `Persona_incierta/`, `Cluster_rechazado/`), override
-  humano de V2.4.1 vía `--decisions` y bloques `DESTINATIONS`/`CONFIDENCE`.
-- V2.6 (implementado): `organize-apply`, movimientos reales con
-  dry-run por defecto, snapshots before/after, manifiesto de rollback y
-  `organize-rollback` para deshacer; el gate de seguridad cubre el nuevo
-  módulo con allowlist explícita.
-- V3: parsing de documentos, OCR local, clasificación documental.
-- V4: búsqueda local, consultas SQLite, embeddings locales.
-- V5: `plan.json`, dry-run de movimientos, apply, rollback.
+**Implementado y verificado en esta rama (`feature/guided-flow`):**
+
+- `V1`–`V2.1`: escaneo read-only, SHA-256 para duplicados exactos y `dHash` para similitud visual.
+- `V2.2`–`V2.4.1`: muestreo efímero de video (`sample-frames`), detección YuNet (`detect-faces`), clustering anónimo SFace (`cluster-people`) y revisión visual HTML offline (`face-review` / `face-review-import`).
+- `V2.5`–`V2.6`: vista previa con confianza (`organize-preview`), visor local (`preview-serve`), ejecución segura con `dry-run` por defecto (`organize-apply`) y reversión (`organize-rollback`).
+- `V3.0`–`V3.2` + `F1` + `organize`: enriquecimiento EXIF/XMP (`ExifTool`), identidades canónicas (`persons`, `person-merge`, `person-rename`, `person-suggest`, `person-calibrate`), etiquetas (`tag`/`untag`), búsqueda estructurada (`search`), escaneo incremental y flujo guiado (`lfo organize`).
+
+**Pendiente (roadmap futuro):**
+
+- Parsing de documentos y OCR local / clasificación documental.
+- Motor de reglas declarativas sobre etiquetas, dispositivos y fechas.
+- Interfaz gráfica completa local (más allá de `face-review` y `preview-serve`).
